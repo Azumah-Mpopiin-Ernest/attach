@@ -1,0 +1,209 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function profileExists() {
+      return signedIn() && exists(
+        /databases/$(database)/documents/users/$(request.auth.uid)
+      );
+    }
+
+    function profile() {
+      return get(
+        /databases/$(database)/documents/users/$(request.auth.uid)
+      ).data;
+    }
+
+    function hasRole(role) {
+      return profileExists()
+        && profile().role == role
+        && profile().active == true;
+    }
+
+    function isAdmin() {
+      return hasRole('admin');
+    }
+
+    function isDoctor() {
+      return hasRole('doctor');
+    }
+
+    function isOfficer() {
+      return hasRole('officer');
+    }
+
+    function hasBothDoctorSignatures(data) {
+      return data.referredFromDoctorId is string
+        && data.referredToDoctorId is string
+        && data.referredFromDoctorId != ''
+        && data.referredToDoctorId != ''
+        && data.referredFromDoctorId != data.referredToDoctorId;
+    }
+
+    function preservesOrAddsOwnId(newData, oldData, field) {
+      return (
+        newData.keys().hasAny([field])
+        && newData[field] == request.auth.uid
+      ) || (
+        !newData.keys().hasAny([field])
+        && !oldData.keys().hasAny([field])
+      ) || (
+        newData.keys().hasAny([field])
+        && oldData.keys().hasAny([field])
+        && newData[field] == oldData[field]
+      );
+    }
+
+    match /users/{userId} {
+      // Admins need the directory; users may read their own profile.
+      allow read: if isAdmin() || (signedIn() && request.auth.uid == userId);
+
+      // Self-registration may create only doctor or officer profiles.
+      // Admin accounts must be provisioned separately by a trusted operator.
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.role in ['doctor', 'officer']
+        && request.resource.data.active == true
+        && request.resource.data.email == request.auth.token.email;
+
+      // Users may update only their own signature. Admins may only change
+      // account activation state, never role or identity fields.
+      allow update: if (
+          signedIn()
+          && request.auth.uid == userId
+          && request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly(['signaturePngUrl'])
+        ) || (
+          isAdmin()
+          && request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly(['active'])
+        );
+
+      allow delete: if false;
+    }
+
+    match /registrationKeys/{keyId} {
+      allow read: if isAdmin()
+        || (
+          !signedIn()
+          && resource.data.used == false
+          && resource.data.revoked == false
+        );
+
+      allow create: if isAdmin();
+
+      // Admins can revoke keys. A newly authenticated user can consume a key
+      // only through the signup transaction and cannot change its role/code.
+      allow update: if (
+          isAdmin()
+          && request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly(['revoked'])
+        ) || (
+          signedIn()
+          && resource.data.used == false
+          && resource.data.revoked == false
+          && request.resource.data.used == true
+          && request.resource.data.usedByUid == request.auth.uid
+          && request.resource.data.diff(resource.data)
+            .affectedKeys()
+            .hasOnly(['used', 'usedByUid', 'usedByName', 'usedAt'])
+        );
+
+      allow delete: if isAdmin();
+    }
+
+    match /referrals/{referralId} {
+      // Admins need the explorer. Doctors see the signing queue; officers see
+      // only records assigned to their own profile name.
+      allow read: if isAdmin()
+        || (isDoctor() && resource.data.status == 'AWAITING_SIGN')
+        || (isOfficer() && resource.data.assignedTo == profile().fullName);
+
+      allow create: if isAdmin();
+
+      // Admin assignment is only legal from READY_TO_ASSIGN and requires two
+      // distinct doctor signatures. Admin manual status changes are limited to
+      // the fields used by the Explorer override actions.
+      allow update: if (
+          isAdmin()
+          && resource.data.status == 'READY_TO_ASSIGN'
+          && request.resource.data.status == 'ASSIGNED'
+          && hasBothDoctorSignatures(resource.data)
+          && request.resource.data.assignedTo is string
+          && request.resource.data.assignedTo != ''
+          && request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly(['status', 'assignedTo', 'assignedAt'])
+        ) || (
+          isAdmin()
+          && request.resource.data.status in ['AWAITING_SIGN', 'READY_TO_ASSIGN']
+          && request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly([
+              'status', 'assignedOfficerId', 'lockedAt', 'statusHistory'
+            ])
+        ) || (
+          isDoctor()
+          && resource.data.status == 'AWAITING_SIGN'
+          && request.resource.data.status in ['AWAITING_SIGN', 'READY_TO_ASSIGN']
+          && request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly([
+              'referredFromDoctorId', 'referredFromDoctorName',
+              'referredFromSignatureUrl', 'referredFromSignedAt',
+              'referredToDoctorId', 'referredToDoctorName',
+              'referredToSignatureUrl', 'referredToSignedAt',
+              'status', 'statusHistory'
+            ])
+          && (
+            request.resource.data.referredFromDoctorId == request.auth.uid
+            || request.resource.data.referredToDoctorId == request.auth.uid
+          )
+          && preservesOrAddsOwnId(
+            request.resource.data,
+            resource.data,
+            'referredFromDoctorId'
+          )
+          && preservesOrAddsOwnId(
+            request.resource.data,
+            resource.data,
+            'referredToDoctorId'
+          )
+        );
+
+      // Officers may remove only their own assigned records after completion.
+      // The matching metrics write is allowed below for the current client
+      // flow; use a Cloud Function for stronger cross-document enforcement.
+      allow delete: if isOfficer()
+        && resource.data.status == 'ASSIGNED'
+        && resource.data.assignedTo == profile().fullName;
+    }
+
+    match /metrics/{metricId} {
+      allow read: if isAdmin();
+
+      // Supports the client completion flow. A trusted Cloud Function should
+      // own this write if metrics must be tamper-proof across documents.
+      allow create: if isOfficer()
+        && metricId == 'summary'
+        && request.resource.data.keys().hasOnly(['completedCount'])
+        && request.resource.data.completedCount == 1;
+
+      allow update: if isOfficer()
+        && metricId == 'summary'
+        && request.resource.data.diff(resource.data)
+          .affectedKeys().hasOnly(['completedCount'])
+        && request.resource.data.completedCount
+          == resource.data.completedCount + 1;
+
+      allow delete: if false;
+    }
+
+    match /auditLog/{entryId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() || isDoctor() || isOfficer();
+      allow update, delete: if false;
+    }
+  }
+}

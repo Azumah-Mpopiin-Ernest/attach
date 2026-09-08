@@ -160,6 +160,8 @@ export default function AuthPage({ requiredRole = null }) {
       query(
         collection(db, "registrationKeys"),
         where("code", "==", normalizedKey),
+        where("used", "==", false),
+        where("revoked", "==", false),
         limit(1),
       ),
     );
@@ -198,6 +200,8 @@ export default function AuthPage({ requiredRole = null }) {
         query(
           collection(db, "registrationKeys"),
           where("code", "==", normalizedKey),
+          where("used", "==", false),
+          where("revoked", "==", false),
           limit(1),
         ),
       );
