@@ -28,3 +28,8 @@ dist-ssr
 src/JUNE OPD 26.xlsx
 SELINA HENEWAA.jpg
 referral form.jpg
+
+# Local Firebase deployment configuration
+.firebaserc
+firebase.json
+firestore.rules
