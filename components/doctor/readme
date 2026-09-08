@@ -1,0 +1,78 @@
+# Doctor Module — Referral Bridge
+
+React components for the Doctor role: Pending Signatures (landing), the
+Sign detail screen, Signed History, and Profile/Signature Setup.
+
+## Structure
+
+```
+doctor/
+  DoctorApp.jsx            entry point — wires layout + navigation + toast
+  DoctorLayout.jsx           top tab bar shell (3 tabs, not a sidebar)
+  components/
+    StatusChip.jsx            status pill (AWAITING_SIGN / READY_TO_ATTACH / DONE)
+    SignatureCanvas.jsx        dependency-free canvas drawing pad
+    ConfirmDialog.jsx          shared confirm modal (used for signature redraw)
+  pages/
+    DoctorPending.jsx           landing screen — action queue
+    DoctorSign.jsx               referral detail + live preview + Approve & Sign
+    DoctorHistory.jsx            read-only signed history
+    DoctorProfile.jsx            one-time signature capture
+```
+
+## Why the Sign screen isn't a nav tab
+
+Per the UX spec, a doctor only ever opens a referral to act on it — there's
+no separate "browse mode." `DoctorSign` is reached by clicking a row in
+`DoctorPending`, not from the tab bar. `DoctorApp.jsx` handles this by
+keeping the tab bar visually on "Pending Signatures" while the Sign screen
+is open, and returning there on both "Back" and successful signing.
+
+## Dependencies
+
+```bash
+npm install lucide-react
+```
+
+Tailwind CSS must already be configured in the host project. No canvas or
+signature-pad library is used — `SignatureCanvas.jsx` is a small,
+dependency-free wrapper around the native `<canvas>` element.
+
+## Wiring to Firebase
+
+1. **DoctorPending.jsx** — replace `MOCK_PENDING` with a live query:
+   `referrals` where `status == "AWAITING_SIGN"`, ordered by
+   `referralDate` ascending.
+2. **DoctorSign.jsx** — replace `MOCK_REFERRAL` with a real fetch of
+   `referrals/{referralId}`. Replace the simulated `setTimeout` in the
+   `"generating"` stage with:
+   a. jsPDF generation using the doctor's real signature and this
+      referral's fields, at `format: [150, 100]`, landscape, mm units.
+   b. Upload the resulting PDF blob to Cloud Storage at
+      `referrals/{referralId}.pdf`.
+   c. Write `pdfStorageUrl`, `signedByDoctorId`, `signedAt`, and
+      `status: "READY_TO_ATTACH"` to the referral doc in one update, plus
+      an `arrayUnion` append to `statusHistory`.
+3. **DoctorHistory.jsx** — replace `MOCK_HISTORY` with a live query:
+   `referrals` where `signedByDoctorId == currentUid`, ordered by
+   `signedAt` descending.
+4. **DoctorProfile.jsx** — replace the `TODO` in `handleSave` with a real
+   upload of the canvas's PNG data URL to Cloud Storage at
+   `signatures/{uid}.png` (downscale/compress first — cap resolution, e.g.
+   600×300px, per the build spec), then save the resulting URL to
+   `users/{uid}.signaturePngUrl`.
+5. **DoctorApp.jsx** — pass `hasSignature` and `signatureDataUrl` down from
+   the signed-in doctor's `users/{uid}` document, fetched once at the App
+   root (or via a shared auth/profile context) rather than re-fetched per
+   page.
+
+## Notes on the design choices
+
+- `DoctorSign`'s preview panel is styled at the real `150 / 100` aspect
+  ratio so text-overflow issues on long names/reasons surface during
+  development, not after the real jsPDF template is built.
+- If a doctor has no saved signature yet, `DoctorSign` shows a setup
+  prompt instead of a broken sign flow — never a dead end.
+- Redrawing an existing signature requires confirmation, but it does not
+  and should not affect PDFs already generated from the old signature —
+  the dialog copy makes this explicit to avoid doctor confusion.
