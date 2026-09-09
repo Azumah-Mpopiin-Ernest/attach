@@ -1,3 +1,5 @@
+import hospitalLogo from "../hfch-logo.png";
+
 const FORM_WIDTH = 1600;
 const FORM_HEIGHT = 1067;
 export async function downloadReferralForm(referral) {
@@ -13,7 +15,7 @@ export async function downloadReferralForm(referral) {
   context.strokeRect(38, 38, FORM_WIDTH - 76, FORM_HEIGHT - 76);
   context.strokeRect(62, 62, FORM_WIDTH - 124, FORM_HEIGHT - 124);
 
-  const logo = await loadImage("/hfch-logo.png");
+  const logo = await loadImage(hospitalLogo);
 
   // Measure the title text first so the crest can sit flush against it,
   // matching the physical form where the logo touches the first letter.
