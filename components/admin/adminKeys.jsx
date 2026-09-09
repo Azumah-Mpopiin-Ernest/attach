@@ -27,7 +27,7 @@ const STATUS_LABEL = {
 
 export default function AdminKeys() {
   const [keys, setKeys] = useState([]);
-  const [role, setRole] = useState("Doctor");
+  const [role, setRole] = useState("doctor");
   const [copiedId, setCopiedId] = useState(null);
   const [pendingRevoke, setPendingRevoke] = useState(null);
   const [error, setError] = useState("");
@@ -137,8 +137,8 @@ export default function AdminKeys() {
           onChange={(e) => setRole(e.target.value)}
           className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-700 focus:border-[#2F6F62] focus:outline-none"
         >
-          <option>Doctor</option>
-          <option>Officer</option>
+          <option value={"doctor"}>Doctor</option>
+          <option value={"officer"}>Officer</option>
         </select>
         <button
           type="button"
