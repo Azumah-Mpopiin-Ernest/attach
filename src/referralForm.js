@@ -87,16 +87,16 @@ export async function downloadReferralForm(referral) {
   await drawSignature(
     context,
     referral.referredFromSignatureUrl,
-    310,
-    585,
+    285,
+    550,
     300,
     85,
   );
   await drawSignature(
     context,
     referral.referredToSignatureUrl,
-    1060,
-    585,
+    1035,
+    550,
     300,
     85,
   );
