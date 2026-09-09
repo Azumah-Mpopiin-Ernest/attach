@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   createUserWithEmailAndPassword,
   browserLocalPersistence,
@@ -48,6 +48,7 @@ export default function AuthPage({ requiredRole = null }) {
   const [mode, setMode] = useState("signin");
   const [session, setSession] = useState(null);
   const [authLoading, setAuthLoading] = useState(Boolean(auth && db));
+  const creatingAccount = useRef(false);
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -62,6 +63,13 @@ export default function AuthPage({ requiredRole = null }) {
         unsubscribe = onAuthStateChanged(auth, async (user) => {
           if (!user) {
             setSession(null);
+            setAuthLoading(false);
+            return;
+          }
+
+          // Auth signs the new user in before the signup profile batch has
+          // committed. Let that batch finish before validating the session.
+          if (creatingAccount.current) {
             setAuthLoading(false);
             return;
           }
@@ -183,6 +191,7 @@ export default function AuthPage({ requiredRole = null }) {
       throw new Error("This registration key has an unsupported role.");
 
     let credential;
+    creatingAccount.current = true;
     try {
       credential = await createUserWithEmailAndPassword(
         auth,
@@ -211,6 +220,7 @@ export default function AuthPage({ requiredRole = null }) {
 
       return { role: requestedRole, name: fullName.trim() };
     } catch (error) {
+      creatingAccount.current = false;
       if (credential?.user) await credential.user.delete().catch(() => {});
       throw new Error(authErrorMessage(error));
     }
@@ -270,6 +280,7 @@ export default function AuthPage({ requiredRole = null }) {
       onValidateKey={handleValidateKey}
       onCreateAccount={handleCreateAccount}
       onSignUpSuccess={() => {
+        creatingAccount.current = false;
         signOut(auth).finally(() => {
           setSession(null);
           setMode("signin");
