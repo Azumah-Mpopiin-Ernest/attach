@@ -137,8 +137,8 @@ export default function AdminKeys() {
           onChange={(e) => setRole(e.target.value)}
           className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-700 focus:border-[#2F6F62] focus:outline-none"
         >
-          <option value={"doctor"}>Doctor</option>
-          <option value={"officer"}>Officer</option>
+          <option value="doctor">Doctor</option>
+          <option value="officer">Officer</option>
         </select>
         <button
           type="button"

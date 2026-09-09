@@ -21,10 +21,15 @@ import {
 //   <SignUp
 //     onValidateKey={async (key) => {
 //       // look up registrationKeys/{key} in Firestore
-//       // return { valid: true, role: "doctor" }
+//       // return { valid: true, role: "doctor", keyId: <the doc's own id> }
 //       // or     { valid: false, reason: "This key isn't valid. Check with your admin." }
+//       // IMPORTANT: keyId must be the exact document ID (e.g. snapshot.id),
+//       // not a re-trimmed/re-cased copy of the user's typed input — the
+//       // security rules do a get() on registrationKeys/{registrationKeyId}
+//       // and a mismatched id resolves to a nonexistent doc, which throws
+//       // inside the rule and surfaces as "missing or insufficient permissions".
 //     }}
-//     onCreateAccount={async ({ registrationKey, fullName, email, password, role }) => {
+//     onCreateAccount={async ({ registrationKeyId, fullName, email, password, role }) => {
 //       // createUserWithEmailAndPassword, write users/{uid} with { role, fullName, ... },
 //       // mark the key as used. Return/resolve on success, throw Error(message) on failure.
 //     }}
@@ -54,6 +59,7 @@ export default function SignUp({
 }) {
   const [step, setStep] = useState("key"); // "key" | "details"
   const [registrationKey, setRegistrationKey] = useState("");
+  const [registrationKeyId, setRegistrationKeyId] = useState(null);
   const [role, setRole] = useState(null);
 
   const [fullName, setFullName] = useState("");
@@ -77,6 +83,10 @@ export default function SignUp({
       const result = await onValidateKey(registrationKey.trim());
       if (result?.valid) {
         setRole(result.role);
+        // Store the canonical doc id returned by the validator, not the
+        // raw typed string — this is what gets written to the new user
+        // doc, and it must exactly match registrationKeys/{id}.
+        setRegistrationKeyId(result.keyId);
         setStep("details");
       } else {
         setKeyError(
@@ -92,6 +102,7 @@ export default function SignUp({
 
   const handleChangeKey = () => {
     setStep("key");
+    setRegistrationKeyId(null);
     setFormError(null);
   };
 
@@ -104,7 +115,7 @@ export default function SignUp({
 
     try {
       await onCreateAccount({
-        registrationKey: registrationKey.trim(),
+        registrationKeyId,
         fullName: fullName.trim(),
         email: email.trim(),
         password,
