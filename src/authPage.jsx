@@ -8,12 +8,7 @@ import {
   signOut,
   updateProfile,
 } from "firebase/auth";
-import {
-  doc,
-  getDoc,
-  runTransaction,
-  serverTimestamp,
-} from "firebase/firestore";
+import { doc, getDoc, serverTimestamp, writeBatch } from "firebase/firestore";
 import { Navigate, useLocation, useNavigate } from "react-router-dom";
 import SignIn from "./signIn";
 import SignUp from "./signUp";
@@ -177,49 +172,42 @@ export default function AuthPage({ requiredRole = null }) {
     const normalizedKey = String(registrationKeyId ?? "")
       .trim()
       .toUpperCase();
+    const normalizedEmail = String(email ?? "")
+      .trim()
+      .toLowerCase();
     if (!normalizedKey)
       throw new Error("A valid registration key is required.");
+    if (!normalizedEmail) throw new Error("A valid email is required.");
     const requestedRole = normalizeRole(role);
     if (!requestedRole)
       throw new Error("This registration key has an unsupported role.");
 
     let credential;
     try {
-      credential = await createUserWithEmailAndPassword(auth, email, password);
+      credential = await createUserWithEmailAndPassword(
+        auth,
+        normalizedEmail,
+        password,
+      );
       await updateProfile(credential.user, { displayName: fullName });
 
       const keyRef = doc(db, "registrationKeys", normalizedKey);
-      const keySnapshot = await getDoc(keyRef);
-      if (!keySnapshot.exists())
-        throw new Error("This registration key is invalid.");
-
-      await runTransaction(db, async (transaction) => {
-        const currentKey = (await transaction.get(keyRef)).data();
-        const keyRole = normalizeRole(currentKey?.role);
-        if (
-          currentKey?.used ||
-          currentKey?.revoked ||
-          !keyRole ||
-          keyRole !== requestedRole
-        ) {
-          throw new Error("This registration key is no longer available.");
-        }
-
-        transaction.set(doc(db, "users", credential.user.uid), {
-          fullName: fullName.trim(),
-          email: email.trim().toLowerCase(),
-          role: keyRole,
-          registrationKeyId: normalizedKey,
-          active: true,
-          createdAt: serverTimestamp(),
-        });
-        transaction.update(keyRef, {
-          used: true,
-          usedByUid: credential.user.uid,
-          usedByName: fullName.trim(),
-          usedAt: serverTimestamp(),
-        });
+      const accountBatch = writeBatch(db);
+      accountBatch.set(doc(db, "users", credential.user.uid), {
+        fullName: fullName.trim(),
+        email: normalizedEmail,
+        role: requestedRole,
+        registrationKeyId: normalizedKey,
+        active: true,
+        createdAt: serverTimestamp(),
       });
+      accountBatch.update(keyRef, {
+        used: true,
+        usedByUid: credential.user.uid,
+        usedByName: fullName.trim(),
+        usedAt: serverTimestamp(),
+      });
+      await accountBatch.commit();
 
       return { role: requestedRole, name: fullName.trim() };
     } catch (error) {
