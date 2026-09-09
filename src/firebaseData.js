@@ -1,6 +1,7 @@
 import {
   addDoc,
   collection,
+  deleteDoc,
   doc,
   getDoc,
   getDocs,
@@ -198,6 +199,13 @@ export function createDocument(collectionName, data) {
 export function updateDocument(collectionName, documentId, changes) {
   if (!db) return Promise.reject(new Error("Firebase is not configured."));
   return updateDoc(doc(db, collectionName, documentId), changes).then(() => {
+    invalidateCollection(collectionName);
+  });
+}
+
+export function deleteDocument(collectionName, documentId) {
+  if (!db) return Promise.reject(new Error("Firebase is not configured."));
+  return deleteDoc(doc(db, collectionName, documentId)).then(() => {
     invalidateCollection(collectionName);
   });
 }
