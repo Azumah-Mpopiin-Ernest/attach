@@ -163,18 +163,22 @@ export default function AuthPage({ requiredRole = null }) {
         reason: "This key is invalid, revoked, used, or unsupported.",
       };
     }
-    return { valid: true, role };
+    return { valid: true, role, keyId: keySnapshot.id };
   };
 
   const handleCreateAccount = async ({
-    registrationKey,
+    registrationKeyId,
     fullName,
     email,
     password,
     role,
   }) => {
     if (!auth || !db) throw new Error("Firebase is not configured.");
-    const normalizedKey = registrationKey.trim().toUpperCase();
+    const normalizedKey = String(registrationKeyId ?? "")
+      .trim()
+      .toUpperCase();
+    if (!normalizedKey)
+      throw new Error("A valid registration key is required.");
     const requestedRole = normalizeRole(role);
     if (!requestedRole)
       throw new Error("This registration key has an unsupported role.");

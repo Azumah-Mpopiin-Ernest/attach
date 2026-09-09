@@ -1,10 +1,6 @@
 import { useEffect, useState } from "react";
 import ConfirmDialog from "./confirmDialog";
-import {
-  deleteDocument,
-  getCollection,
-  updateDocument,
-} from "../../src/firebaseData";
+import { getCollection, updateDocument } from "../../src/firebaseData";
 import Pagination from "../shared/Pagination";
 
 const PAGE_SIZE = 25;
@@ -19,7 +15,6 @@ export default function AdminUsers() {
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [pendingUser, setPendingUser] = useState(null); // user being toggled
-  const [pendingDeleteUser, setPendingDeleteUser] = useState(null);
   const [error, setError] = useState("");
   const [page, setPage] = useState(1);
 
@@ -54,16 +49,6 @@ export default function AdminUsers() {
       .catch((writeError) => setError(writeError.message));
   };
 
-  const applyDelete = () => {
-    if (!pendingDeleteUser) return;
-    deleteDocument("users", pendingDeleteUser.id)
-      .then(async () => {
-        setUsers(await getCollection("users", { force: true }));
-        setPendingDeleteUser(null);
-      })
-      .catch((writeError) => setError(writeError.message));
-  };
-
   return (
     <div>
       <h1 className="text-xl font-semibold text-slate-900">Users</h1>
@@ -80,7 +65,6 @@ export default function AdminUsers() {
               <th className="px-5 py-3 font-medium">Role</th>
               <th className="px-5 py-3 font-medium">Status</th>
               <th className="px-5 py-3 font-medium text-right">Actions</th>
-              <th className="px-5 py-3 font-medium text-right">Delete</th>
             </tr>
           </thead>
           <tbody>
@@ -127,21 +111,12 @@ export default function AdminUsers() {
                       {user.active ? "Deactivate" : "Reactivate"}
                     </button>
                   </td>
-                  <td className="px-5 py-3 text-right">
-                    <button
-                      type="button"
-                      onClick={() => setPendingDeleteUser(user)}
-                      className="rounded-md px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-50"
-                    >
-                      Delete
-                    </button>
-                  </td>
                 </tr>
               ))}
             {!loading && users.length === 0 && (
               <tr>
                 <td
-                  colSpan={5}
+                  colSpan={4}
                   className="px-5 py-10 text-center text-slate-400"
                 >
                   No users found.
@@ -174,16 +149,6 @@ export default function AdminUsers() {
         tone={pendingUser?.active ? "danger" : "default"}
         onConfirm={applyToggle}
         onCancel={() => setPendingUser(null)}
-      />
-
-      <ConfirmDialog
-        open={Boolean(pendingDeleteUser)}
-        title={`Delete ${pendingDeleteUser?.name ?? pendingDeleteUser?.email ?? "this user"}?`}
-        description="This removes their Referral Bridge profile and prevents future access. Their Firebase sign-in account may still require separate removal by an administrator in the Firebase Console."
-        confirmLabel="Delete user"
-        tone="danger"
-        onConfirm={applyDelete}
-        onCancel={() => setPendingDeleteUser(null)}
       />
     </div>
   );
