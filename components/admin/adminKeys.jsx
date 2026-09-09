@@ -1,14 +1,13 @@
 import { useEffect, useState } from "react";
 import { Copy, Check } from "lucide-react";
+import { doc, getDoc, setDoc } from "firebase/firestore";
 import ConfirmDialog from "./confirmDialog";
-import {
-  createDocument,
-  getCollection,
-  updateDocument,
-} from "../../src/firebaseData";
+import { db } from "../../src/firebase";
+import { getCollection, updateDocument } from "../../src/firebaseData";
 import Pagination from "../shared/Pagination";
 
 const PAGE_SIZE = 25;
+const MAX_GENERATE_ATTEMPTS = 5;
 
 function generateCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -32,6 +31,7 @@ export default function AdminKeys() {
   const [copiedId, setCopiedId] = useState(null);
   const [pendingRevoke, setPendingRevoke] = useState(null);
   const [error, setError] = useState("");
+  const [generating, setGenerating] = useState(false);
   const [page, setPage] = useState(1);
 
   const pageCount = Math.max(1, Math.ceil(keys.length / PAGE_SIZE));
@@ -51,22 +51,50 @@ export default function AdminKeys() {
     };
   }, []);
 
-  const handleGenerate = () => {
-    createDocument("registrationKeys", {
-      code: generateCode(),
-      role,
-      used: false,
-      revoked: false,
-      createdAt: new Date(),
-    })
-      .then(async () =>
-        setKeys(
-          (await getCollection("registrationKeys", { force: true })).sort(
-            compareCreatedAtDescending,
-          ),
+  // Keys are now keyed by their own code (see firestore.rules, which relies
+  // on registrationKeyId matching the doc ID for the unauthenticated get()
+  // lookup during signup). Since we no longer get a Firestore-assigned
+  // unique ID for free, check for a collision before writing and just
+  // regenerate on the rare case one occurs.
+  const handleGenerate = async () => {
+    setError("");
+    setGenerating(true);
+    try {
+      let code;
+      let exists = true;
+      let attempts = 0;
+
+      do {
+        code = generateCode();
+        const snapshot = await getDoc(doc(db, "registrationKeys", code));
+        exists = snapshot.exists();
+        attempts += 1;
+      } while (exists && attempts < MAX_GENERATE_ATTEMPTS);
+
+      if (exists) {
+        throw new Error(
+          "Could not generate a unique registration key. Please try again.",
+        );
+      }
+
+      await setDoc(doc(db, "registrationKeys", code), {
+        code,
+        role,
+        used: false,
+        revoked: false,
+        createdAt: new Date(),
+      });
+
+      setKeys(
+        (await getCollection("registrationKeys", { force: true })).sort(
+          compareCreatedAtDescending,
         ),
-      )
-      .catch((writeError) => setError(writeError.message));
+      );
+    } catch (writeError) {
+      setError(writeError.message);
+    } finally {
+      setGenerating(false);
+    }
   };
 
   const handleCopy = (key) => {
@@ -115,9 +143,10 @@ export default function AdminKeys() {
         <button
           type="button"
           onClick={handleGenerate}
-          className="ml-auto rounded-md bg-[#2F6F62] px-4 py-1.5 text-sm font-medium text-white hover:bg-[#265a50]"
+          disabled={generating}
+          className="ml-auto rounded-md bg-[#2F6F62] px-4 py-1.5 text-sm font-medium text-white hover:bg-[#265a50] disabled:opacity-50"
         >
-          Generate
+          {generating ? "Generating..." : "Generate"}
         </button>
       </div>
 

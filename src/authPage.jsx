@@ -9,15 +9,10 @@ import {
   updateProfile,
 } from "firebase/auth";
 import {
-  collection,
   doc,
   getDoc,
-  getDocs,
-  limit,
-  query,
   runTransaction,
   serverTimestamp,
-  where,
 } from "firebase/firestore";
 import { Navigate, useLocation, useNavigate } from "react-router-dom";
 import SignIn from "./signIn";
@@ -156,20 +151,13 @@ export default function AuthPage({ requiredRole = null }) {
   const handleValidateKey = async (key) => {
     if (!db) throw new Error("Firebase is not configured.");
     const normalizedKey = key.trim().toUpperCase();
-    const snapshot = await getDocs(
-      query(
-        collection(db, "registrationKeys"),
-        where("code", "==", normalizedKey),
-        where("used", "==", false),
-        where("revoked", "==", false),
-        limit(1),
-      ),
+    const keySnapshot = await getDoc(
+      doc(db, "registrationKeys", normalizedKey),
     );
-    const keyDocument = snapshot.docs[0];
-    const keyData = keyDocument?.data();
+    const keyData = keySnapshot.exists() ? keySnapshot.data() : null;
     const role = normalizeRole(keyData?.role);
 
-    if (!keyDocument || keyData.used || keyData.revoked || !role) {
+    if (!keySnapshot.exists() || keyData.used || keyData.revoked || !role) {
       return {
         valid: false,
         reason: "This key is invalid, revoked, used, or unsupported.",
@@ -196,20 +184,13 @@ export default function AuthPage({ requiredRole = null }) {
       credential = await createUserWithEmailAndPassword(auth, email, password);
       await updateProfile(credential.user, { displayName: fullName });
 
-      const keySnapshot = await getDocs(
-        query(
-          collection(db, "registrationKeys"),
-          where("code", "==", normalizedKey),
-          where("used", "==", false),
-          where("revoked", "==", false),
-          limit(1),
-        ),
-      );
-      const keyDocument = keySnapshot.docs[0];
-      if (!keyDocument) throw new Error("This registration key is invalid.");
+      const keyRef = doc(db, "registrationKeys", normalizedKey);
+      const keySnapshot = await getDoc(keyRef);
+      if (!keySnapshot.exists())
+        throw new Error("This registration key is invalid.");
 
       await runTransaction(db, async (transaction) => {
-        const currentKey = (await transaction.get(keyDocument.ref)).data();
+        const currentKey = (await transaction.get(keyRef)).data();
         const keyRole = normalizeRole(currentKey?.role);
         if (
           currentKey?.used ||
@@ -224,11 +205,11 @@ export default function AuthPage({ requiredRole = null }) {
           fullName: fullName.trim(),
           email: email.trim().toLowerCase(),
           role: keyRole,
-          registrationKeyId: keyDocument.id,
+          registrationKeyId: normalizedKey,
           active: true,
           createdAt: serverTimestamp(),
         });
-        transaction.update(keyDocument.ref, {
+        transaction.update(keyRef, {
           used: true,
           usedByUid: credential.user.uid,
           usedByName: fullName.trim(),

@@ -1,15 +1,21 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Loader2, PenTool } from "lucide-react";
 import { subscribeToReferral, updateReferral } from "../../src/firebaseData";
 
 // hasSignature: pass this in from the doctor's profile doc. When false,
 // this screen shows a setup prompt instead of the sign flow — never a
 // dead-end error (per UX spec 5.2).
+//
+// doctorName is required now: it's written onto whichever signer slot
+// (referredFrom / referredTo) this doctor occupies, so the caller (e.g.
+// DoctorPending) must pass it through the same way it already passes
+// doctorId and signatureUrl.
 export default function DoctorSign({
   referralId,
   hasSignature = true,
   signatureDataUrl,
   doctorId,
+  doctorName,
   onBack,
   onSigned,
   onGoToProfile,
@@ -31,23 +37,68 @@ export default function DoctorSign({
     );
   }, [referralId]);
 
+  // A referral has two signer slots, referredFrom and referredTo, each
+  // filled by a different doctor. This doctor fills whichever slot is
+  // still empty — but never a second slot on a referral they've already
+  // signed, and never when both slots are already spoken for.
+  const signSlot = useMemo(() => {
+    if (!referral || !doctorId) return null;
+
+    const fromId = referral.referredFromDoctorId || "";
+    const toId = referral.referredToDoctorId || "";
+
+    if (fromId === doctorId || toId === doctorId) return "already-signed";
+    if (fromId && toId) return "fully-signed";
+    if (!fromId) return "from";
+    if (!toId) return "to";
+    return null;
+  }, [referral, doctorId]);
+
   useEffect(() => {
     if (stage !== "generating") return;
     if (!referral || !doctorId) return;
+    if (signSlot !== "from" && signSlot !== "to") return;
     if (signAttemptRef.current === referral.id) return;
     signAttemptRef.current = referral.id;
 
+    const now = new Date();
+    const slotFields =
+      signSlot === "from"
+        ? {
+            referredFromDoctorId: doctorId,
+            referredFromDoctorName: doctorName ?? "",
+            referredFromSignatureUrl: signatureDataUrl ?? "",
+            referredFromSignedAt: now,
+          }
+        : {
+            referredToDoctorId: doctorId,
+            referredToDoctorName: doctorName ?? "",
+            referredToSignatureUrl: signatureDataUrl ?? "",
+            referredToSignedAt: now,
+          };
+
+    const resultingFromId =
+      signSlot === "from" ? doctorId : referral.referredFromDoctorId;
+    const resultingToId =
+      signSlot === "to" ? doctorId : referral.referredToDoctorId;
+    const bothSigned =
+      Boolean(resultingFromId) &&
+      Boolean(resultingToId) &&
+      resultingFromId !== resultingToId;
+    const nextStatus = bothSigned ? "READY_TO_ASSIGN" : "AWAITING_SIGN";
+
     let cancelled = false;
     updateReferral(referral.id, {
-      status: "READY_TO_ASSIGN",
-      signedByDoctorId: doctorId,
-      signedAt: new Date(),
+      ...slotFields,
+      status: nextStatus,
       statusHistory: [
         ...(referral.statusHistory ?? []),
         {
-          status: "READY_TO_ASSIGN",
-          text: "Signed by doctor",
-          at: new Date().toISOString(),
+          status: nextStatus,
+          text: bothSigned
+            ? "Signed by doctor — both signatures complete"
+            : "Signed by doctor, awaiting second signature",
+          at: now.toISOString(),
         },
       ],
     })
@@ -64,7 +115,7 @@ export default function DoctorSign({
     return () => {
       cancelled = true;
     };
-  }, [doctorId, referral, stage]);
+  }, [doctorId, doctorName, referral, signSlot, signatureDataUrl, stage]);
 
   useEffect(() => {
     if (stage !== "done") return;
@@ -102,6 +153,52 @@ export default function DoctorSign({
           className="mt-5 rounded-md bg-[#2F6F62] px-4 py-2 text-sm font-medium text-white hover:bg-[#265a50]"
         >
           Go to Profile
+        </button>
+      </div>
+    );
+  }
+
+  // Defensive states: the pending queue should already filter these out
+  // (a fully-signed referral moves to READY_TO_ASSIGN and drops out of the
+  // doctor's AWAITING_SIGN view), but if the doctor lands here anyway —
+  // e.g. a stale link, or two tabs open — show something explainable
+  // rather than a dead sign button that will fail on submit.
+  if (signSlot === "already-signed") {
+    return (
+      <div className="mx-auto max-w-md rounded-md border border-slate-200 bg-white p-8 text-center">
+        <h2 className="text-base font-semibold text-slate-900">
+          You've already signed this referral
+        </h2>
+        <p className="mt-1 text-sm text-slate-500">
+          It's waiting on the second doctor's signature before it can move
+          forward.
+        </p>
+        <button
+          type="button"
+          onClick={onBack}
+          className="mt-5 rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50"
+        >
+          Back to queue
+        </button>
+      </div>
+    );
+  }
+
+  if (signSlot === "fully-signed") {
+    return (
+      <div className="mx-auto max-w-md rounded-md border border-slate-200 bg-white p-8 text-center">
+        <h2 className="text-base font-semibold text-slate-900">
+          This referral is already fully signed
+        </h2>
+        <p className="mt-1 text-sm text-slate-500">
+          It's moved on to the assignment queue.
+        </p>
+        <button
+          type="button"
+          onClick={onBack}
+          className="mt-5 rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50"
+        >
+          Back to queue
         </button>
       </div>
     );

@@ -85,18 +85,18 @@ export async function downloadReferralForm(referral) {
   await drawSignature(
     context,
     referral.referredFromSignatureUrl,
-    320,
-    530,
-    440,
-    150,
+    310,
+    585,
+    300,
+    85,
   );
   await drawSignature(
     context,
     referral.referredToSignatureUrl,
-    1070,
-    530,
-    440,
-    150,
+    1060,
+    585,
+    300,
+    85,
   );
 
   const blob = await new Promise((resolve) =>
@@ -169,6 +169,24 @@ async function drawSignature(context, source, x, y, width, height) {
   const drawHeight = crop.height * scale;
   const drawX = x + (width - drawWidth) / 2;
   const drawY = y + (height - drawHeight) / 2;
+  const signatureCanvas = document.createElement("canvas");
+  signatureCanvas.width = crop.width;
+  signatureCanvas.height = crop.height;
+  const signatureContext = signatureCanvas.getContext("2d");
+  signatureContext.drawImage(
+    image,
+    crop.x,
+    crop.y,
+    crop.width,
+    crop.height,
+    0,
+    0,
+    crop.width,
+    crop.height,
+  );
+  signatureContext.globalCompositeOperation = "source-in";
+  signatureContext.fillStyle = "#253d98";
+  signatureContext.fillRect(0, 0, crop.width, crop.height);
 
   // Keep the signature crisp instead of soft when a small source image gets
   // scaled up to fill the larger box.
@@ -193,9 +211,9 @@ async function drawSignature(context, source, x, y, width, height) {
   // as bold, pressure-heavy ink rather than a faint smear.
   context.globalAlpha = 1;
   context.drawImage(
-    image,
-    crop.x,
-    crop.y,
+    signatureCanvas,
+    0,
+    0,
     crop.width,
     crop.height,
     drawX,
@@ -205,9 +223,9 @@ async function drawSignature(context, source, x, y, width, height) {
   );
   context.globalAlpha = 0.55;
   context.drawImage(
-    image,
-    crop.x,
-    crop.y,
+    signatureCanvas,
+    0,
+    0,
     crop.width,
     crop.height,
     drawX + 0.6,
