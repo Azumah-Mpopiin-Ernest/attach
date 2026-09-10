@@ -1,4 +1,8 @@
-import hospitalLogo from "../hfch-logo.png";
+// `?inline` forces Vite to embed this as a base64 data URI in the JS bundle
+// instead of emitting it as a separate fetched asset. The logo must render
+// with zero network dependency, since this form is generated while the
+// officer dashboard may be offline.
+import hospitalLogo from "../hfch-logo.png?inline";
 
 const FORM_WIDTH = 1600;
 const FORM_HEIGHT = 1067;
