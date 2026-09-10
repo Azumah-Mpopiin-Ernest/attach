@@ -1,5 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, X, FileText, PenTool, CheckCircle2 } from "lucide-react";
+import {
+  Search,
+  X,
+  FileText,
+  PenTool,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+} from "lucide-react";
 import StatusChip from "./statusChip";
 import ConfirmDialog from "./confirmDialog";
 import {
@@ -8,6 +16,11 @@ import {
   updateDocuments,
   updateReferral,
 } from "../../src/firebaseData";
+import {
+  getDateKey,
+  formatDateLabel,
+  compareDateKeys,
+} from "../../src/referralDates";
 import Pagination from "../shared/Pagination";
 
 const PAGE_SIZE = 25;
@@ -60,6 +73,7 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
   const [officers, setOfficers] = useState([]);
   const [assigning, setAssigning] = useState(false);
   const [page, setPage] = useState(1);
+  const [collapsedDates, setCollapsedDates] = useState(() => new Set());
 
   // Bulk assignment only ever applies to READY_TO_ASSIGN records, so the
   // whole selection UI (checkboxes, the "N selected" bar, the assign
@@ -135,6 +149,29 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
     });
   }, [referrals, statusFilter, query]);
 
+  // In assignment mode, referrals are grouped by the date printed on the
+  // form (referral.referralDate) rather than shown as one flat page — this
+  // is what lets an admin assign a whole day's stack to one officer in a
+  // single action, mirroring how the paper forms used to be sorted before
+  // being handed off.
+  const groupedByDate = useMemo(() => {
+    if (!assignmentModeActive) return [];
+    const groups = new Map();
+    filtered.forEach((referral) => {
+      const key = getDateKey(referral);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(referral);
+    });
+    return Array.from(groups.entries())
+      .sort(([a], [b]) => compareDateKeys(a, b))
+      .map(([key, items]) => ({
+        key,
+        label: formatDateLabel(key),
+        referrals: items,
+        assignableIds: items.filter(isAssignableReferral).map((r) => r.id),
+      }));
+  }, [filtered, assignmentModeActive]);
+
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const currentPage = Math.min(page, pageCount);
   const paginated = filtered.slice(
@@ -152,6 +189,26 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
         ? current.filter((item) => item !== id)
         : [...current, id],
     );
+  };
+
+  const toggleDateGroupSelected = (group) => {
+    const allSelected =
+      group.assignableIds.length > 0 &&
+      group.assignableIds.every((id) => selectedIds.includes(id));
+    setSelectedIds((current) =>
+      allSelected
+        ? current.filter((id) => !group.assignableIds.includes(id))
+        : [...new Set([...current, ...group.assignableIds])],
+    );
+  };
+
+  const toggleCollapsed = (key) => {
+    setCollapsedDates((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
   };
 
   const assignSelected = async (event) => {
@@ -311,49 +368,19 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
         )}
       </div>
 
+      {assignmentModeActive ? (
+        <p className="mt-3 text-xs text-slate-400">
+          Grouped by the date on the form. Tick a date's checkbox to select
+          everything in it, then assign the whole group to one officer in one
+          go.
+        </p>
+      ) : null}
+
       <div className="mt-5 overflow-x-auto rounded-md border border-slate-200 bg-white">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-slate-200 bg-slate-50 text-left text-xs text-slate-500">
-              {assignmentModeActive && (
-                <th className="w-10 px-5 py-3 font-medium">
-                  <input
-                    type="checkbox"
-                    aria-label="Select all visible referrals"
-                    checked={
-                      paginated.some(isAssignableReferral) &&
-                      paginated
-                        .filter(isAssignableReferral)
-                        .every((referral) => selectedIds.includes(referral.id))
-                    }
-                    onChange={() =>
-                      setSelectedIds(
-                        paginated
-                          .filter(isAssignableReferral)
-                          .every((referral) =>
-                            selectedIds.includes(referral.id),
-                          )
-                          ? []
-                          : [
-                              ...new Set([
-                                ...selectedIds,
-                                ...paginated
-                                  .filter(isAssignableReferral)
-                                  .map((referral) => referral.id),
-                              ]),
-                            ],
-                      )
-                    }
-                  />
-                </th>
-              )}
-              <th className="px-5 py-3 font-medium">Patient</th>
-              <th className="px-5 py-3 font-medium">Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {loading &&
-              Array.from({ length: 5 }, (_, index) => (
+        {loading && (
+          <table className="w-full text-sm">
+            <tbody>
+              {Array.from({ length: 5 }, (_, index) => (
                 <tr
                   key={`loading-${index}`}
                   className="border-b border-slate-100"
@@ -363,25 +390,118 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                   </td>
                 </tr>
               ))}
-            {!loading &&
-              paginated.map((r) => (
+            </tbody>
+          </table>
+        )}
+
+        {!loading && assignmentModeActive && (
+          <>
+            {groupedByDate.length === 0 && (
+              <p className="px-5 py-10 text-center text-slate-400">
+                No referrals match these filters.
+              </p>
+            )}
+            {groupedByDate.map((group) => {
+              const allSelected =
+                group.assignableIds.length > 0 &&
+                group.assignableIds.every((id) => selectedIds.includes(id));
+              const isCollapsed = collapsedDates.has(group.key);
+              return (
+                <div
+                  key={group.key}
+                  className="border-b border-slate-200 last:border-0"
+                >
+                  <div className="flex items-center gap-3 bg-slate-50 px-5 py-2.5">
+                    <input
+                      type="checkbox"
+                      aria-label={`Select all referrals for ${group.label}`}
+                      disabled={!group.assignableIds.length}
+                      checked={allSelected}
+                      onChange={() => toggleDateGroupSelected(group)}
+                      className="disabled:opacity-40"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => toggleCollapsed(group.key)}
+                      className="flex flex-1 items-center justify-between gap-3 text-left"
+                    >
+                      <span className="flex items-center gap-1.5 text-sm font-medium text-slate-700">
+                        {isCollapsed ? (
+                          <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
+                        ) : (
+                          <ChevronDown className="h-3.5 w-3.5 text-slate-400" />
+                        )}
+                        {group.label}
+                      </span>
+                      <span className="text-xs text-slate-400">
+                        {group.referrals.length} referral
+                        {group.referrals.length === 1 ? "" : "s"}
+                        {group.assignableIds.length
+                          ? ` · ${group.assignableIds.length} assignable`
+                          : " · none signed by both doctors yet"}
+                      </span>
+                    </button>
+                  </div>
+
+                  {!isCollapsed && (
+                    <table className="w-full text-sm">
+                      <tbody>
+                        {group.referrals.map((r) => (
+                          <tr
+                            key={r.id}
+                            onClick={() => setSelected(r)}
+                            className="cursor-pointer border-b border-slate-100 last:border-0 hover:bg-slate-50"
+                          >
+                            <td className="w-10 px-5 py-3">
+                              <input
+                                type="checkbox"
+                                aria-label={`Select ${r.name ?? r.patientName ?? r.patientId}`}
+                                disabled={!isAssignableReferral(r)}
+                                checked={selectedIds.includes(r.id)}
+                                onChange={() => toggleSelected(r.id)}
+                                onClick={(event) => event.stopPropagation()}
+                              />
+                            </td>
+                            <td className="px-5 py-3">
+                              <div className="font-medium text-slate-800">
+                                {r.name ?? r.patientName}
+                              </div>
+                              <div className="font-mono text-xs text-slate-400">
+                                {r.patientId}
+                              </div>
+                            </td>
+                            <td className="px-5 py-3">
+                              <StatusChip
+                                status={r.status}
+                                officerName={r.assignedTo}
+                              />
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              );
+            })}
+          </>
+        )}
+
+        {!loading && !assignmentModeActive && (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-slate-200 bg-slate-50 text-left text-xs text-slate-500">
+                <th className="px-5 py-3 font-medium">Patient</th>
+                <th className="px-5 py-3 font-medium">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {paginated.map((r) => (
                 <tr
                   key={r.id}
                   onClick={() => setSelected(r)}
                   className="cursor-pointer border-b border-slate-100 last:border-0 hover:bg-slate-50"
                 >
-                  {assignmentModeActive && (
-                    <td className="px-5 py-3">
-                      <input
-                        type="checkbox"
-                        aria-label={`Select ${r.name ?? r.patientName ?? r.patientId}`}
-                        disabled={!isAssignableReferral(r)}
-                        checked={selectedIds.includes(r.id)}
-                        onChange={() => toggleSelected(r.id)}
-                        onClick={(event) => event.stopPropagation()}
-                      />
-                    </td>
-                  )}
                   <td className="px-5 py-3">
                     <div className="font-medium text-slate-800">
                       {r.name ?? r.patientName}
@@ -395,24 +515,28 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                   </td>
                 </tr>
               ))}
-            {!loading && filtered.length === 0 && (
-              <tr>
-                <td
-                  colSpan={columnCount}
-                  className="px-5 py-10 text-center text-slate-400"
-                >
-                  No referrals match these filters.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-        <Pagination
-          page={currentPage}
-          pageCount={pageCount}
-          onPageChange={setPage}
-          total={filtered.length}
-        />
+              {filtered.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={columnCount}
+                    className="px-5 py-10 text-center text-slate-400"
+                  >
+                    No referrals match these filters.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        )}
+
+        {!loading && !assignmentModeActive && (
+          <Pagination
+            page={currentPage}
+            pageCount={pageCount}
+            onPageChange={setPage}
+            total={filtered.length}
+          />
+        )}
       </div>
 
       {/* Detail drawer */}
