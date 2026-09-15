@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  Download,
 } from "lucide-react";
 import StatusChip from "./statusChip";
 import ConfirmDialog from "./confirmDialog";
@@ -22,6 +23,8 @@ import {
   compareDateKeys,
 } from "../../src/referralDates";
 import Pagination from "../shared/Pagination";
+
+import { downloadReadyToAssignFormsZip } from "../../src/referralForm";
 
 const PAGE_SIZE = 25;
 const NOTICE_DURATION_MS = 4000;
@@ -74,6 +77,8 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
   const [assigning, setAssigning] = useState(false);
   const [page, setPage] = useState(1);
   const [collapsedDates, setCollapsedDates] = useState(() => new Set());
+  const [downloadingForms, setDownloadingForms] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState(null); // { formsProcessed, totalForms }
 
   // Bulk assignment only ever applies to READY_TO_ASSIGN records, so the
   // whole selection UI (checkboxes, the "N selected" bar, the assign
@@ -211,6 +216,31 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
     });
   };
 
+  const downloadAllReadyForms = async () => {
+    setDownloadingForms(true);
+    setDownloadProgress(null);
+    try {
+      const currentReferrals = await getReferrals({ force: true });
+      const readyReferrals = currentReferrals.filter(
+        (referral) => referral.status === "READY_TO_ASSIGN",
+      );
+      const sheetCount = await downloadReadyToAssignFormsZip(
+        readyReferrals,
+        undefined,
+        setDownloadProgress,
+      );
+      showNotice(
+        "success",
+        `Downloaded ${sheetCount} print sheet${sheetCount === 1 ? "" : "s"} (${readyReferrals.length} form${readyReferrals.length === 1 ? "" : "s"}).`,
+      );
+    } catch (downloadError) {
+      showNotice("error", downloadError.message);
+    } finally {
+      setDownloadingForms(false);
+      setDownloadProgress(null);
+    }
+  };
+
   const assignSelected = async (event) => {
     const assignedTo = event.target.value;
     if (!assignedTo || !selectedIds.length) return;
@@ -330,6 +360,20 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
             className="w-full rounded-md border border-slate-300 py-1.5 pl-8 pr-3 text-sm focus:border-[#2F6F62] focus:outline-none sm:w-72"
           />
         </div>
+
+        <button
+          type="button"
+          onClick={downloadAllReadyForms}
+          disabled={downloadingForms} /* ...same classes... */
+          className="flex items-center justify-center gap-2 cursor-pointer border border-black hover:bg-[#2F6F62] transition p-2 rounded-xl"
+        >
+          <Download className="h-4 w-4" />
+          {downloadingForms
+            ? downloadProgress
+              ? `Preparing ${downloadProgress.formsProcessed}/${downloadProgress.totalForms}...`
+              : "Preparing PDFs..."
+            : "Download Forms"}
+        </button>
 
         {assignmentModeActive && (
           <label className="flex w-full flex-wrap items-center gap-2 text-sm text-slate-600 sm:ml-auto sm:w-auto sm:flex-nowrap">
