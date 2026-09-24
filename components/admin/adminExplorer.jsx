@@ -318,7 +318,16 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
     setImageProgress(null);
 
     downloadAllReferralImagesZip({
-      loadReferrals: () => getReferrals({ force: true }),
+      loadReferrals: async () => {
+        const current = await getReferrals({ force: true });
+        const ready = current.filter(
+          (referral) => referral.status === "READY_TO_ASSIGN",
+        );
+        if (ready.length === 0) {
+          throw new Error("No referrals are ready to assign.");
+        }
+        return ready;
+      },
       signal: controller.signal,
       onProgress: setImageProgress,
     })
@@ -523,7 +532,7 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
             ? imageProgress?.phase === "rendering"
               ? `Rendering ${imageProgress.done}/${imageProgress.total} · Cancel`
               : "Preparing… · Cancel"
-            : "Download all forms"}
+            : "Export ready forms"}
         </button>
 
         <button
