@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Search,
   X,
@@ -8,6 +8,7 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
+  Trash2,
 } from "lucide-react";
 import StatusChip from "./statusChip";
 import ConfirmDialog from "./confirmDialog";
@@ -16,6 +17,7 @@ import {
   getReferrals,
   updateDocuments,
   updateReferral,
+  deleteAllReferrals,
 } from "../../src/firebaseData";
 import {
   getDateKey,
@@ -25,6 +27,7 @@ import {
 import Pagination from "../shared/Pagination";
 
 import { downloadReadyToAssignFormsZip } from "../../src/referralForm";
+import { downloadAllReferralImagesZip } from "../../src/referralImages";
 
 const PAGE_SIZE = 25;
 const NOTICE_DURATION_MS = 4000;
@@ -80,6 +83,17 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
   const [downloadingForms, setDownloadingForms] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(null); // { formsProcessed, totalForms }
 
+  // Export every referral as an individual PNG inside one ZIP.
+  const [exportingImages, setExportingImages] = useState(false);
+  const [imageProgress, setImageProgress] = useState(null); // { phase, done, total, failed }
+  const exportAbort = useRef(null);
+
+  // Delete-all (typed confirmation).
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteConfirmText, setDeleteConfirmText] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const [deletedCount, setDeletedCount] = useState(0);
+
   // Bulk assignment only ever applies to READY_TO_ASSIGN records, so the
   // whole selection UI (checkboxes, the "N selected" bar, the assign
   // dropdown) is scoped to that filter. Selecting rows on any other filter
@@ -124,6 +138,11 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
     return () => {
       active = false;
     };
+  }, []);
+
+  // Cancel a running image export if the admin navigates away.
+  useEffect(() => {
+    return () => exportAbort.current?.abort();
   }, []);
 
   // Clear any stale selection when leaving Ready to assign, so switching
@@ -286,6 +305,71 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
     }
   };
 
+  // Deliberately NOT async, and nothing is awaited before the call: the
+  // browser's "save as" dialog needs the click's user activation.
+  const downloadAllImages = () => {
+    const controller = new AbortController();
+    exportAbort.current = controller;
+    setExportingImages(true);
+    setImageProgress(null);
+
+    downloadAllReferralImagesZip({
+      loadReferrals: () => getReferrals({ force: true }),
+      signal: controller.signal,
+      onProgress: setImageProgress,
+    })
+      .then(({ written, failed, parts }) => {
+        const partNote = parts > 1 ? ` in ${parts} ZIP files` : "";
+        showNotice(
+          failed.length ? "error" : "success",
+          failed.length
+            ? `Exported ${written} images${partNote}; ${failed.length} failed to render.`
+            : `Exported ${written} referral image${written === 1 ? "" : "s"}${partNote}.`,
+        );
+      })
+      .catch((error) => {
+        if (error?.name !== "AbortError") showNotice("error", error.message);
+      })
+      .finally(() => {
+        setExportingImages(false);
+        setImageProgress(null);
+        exportAbort.current = null;
+      });
+  };
+
+  const closeDeleteDialog = () => {
+    if (deleting) return;
+    setDeleteOpen(false);
+    setDeleteConfirmText("");
+  };
+
+  const deleteEverything = async () => {
+    setDeleting(true);
+    setDeletedCount(0);
+    try {
+      const count = await deleteAllReferrals({ onProgress: setDeletedCount });
+      setReferrals(await getReferrals({ force: true }));
+      setSelectedIds([]);
+      setSelected(null);
+      setDeleteOpen(false);
+      setDeleteConfirmText("");
+      showNotice(
+        "success",
+        `Deleted ${count} referral${count === 1 ? "" : "s"}.`,
+      );
+    } catch (deleteError) {
+      // A partial failure may still have removed some records, so refresh.
+      try {
+        setReferrals(await getReferrals({ force: true }));
+      } catch {
+        /* keep the original error below */
+      }
+      showNotice("error", deleteError.message);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   const assignSelected = async (event) => {
     const assignedTo = event.target.value;
     if (!assignedTo || !selectedIds.length) return;
@@ -409,15 +493,48 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
         <button
           type="button"
           onClick={downloadAllReadyForms}
-          disabled={downloadingForms} /* ...same classes... */
-          className="flex items-center justify-center gap-2 cursor-pointer border border-black hover:bg-[#2F6F62] transition p-2 rounded-xl"
+          disabled={downloadingForms || exportingImages || deleting}
+          className="flex items-center justify-center gap-2 cursor-pointer border border-black hover:bg-[#2F6F62] transition p-2 rounded-xl disabled:cursor-not-allowed disabled:opacity-50"
         >
           <Download className="h-4 w-4" />
           {downloadingForms
             ? downloadProgress
               ? `Preparing ${downloadProgress.formsProcessed}/${downloadProgress.totalForms}...`
               : "Preparing PDFs..."
-            : "Download Forms"}
+            : "Print Forms"}
+        </button>
+
+        <button
+          type="button"
+          onClick={
+            exportingImages
+              ? () => exportAbort.current?.abort()
+              : downloadAllImages
+          }
+          disabled={downloadingForms || deleting}
+          className="flex items-center justify-center gap-2 cursor-pointer border border-black hover:bg-[#2F6F62] transition p-2 rounded-xl disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <Download className="h-4 w-4" />
+          {exportingImages
+            ? imageProgress?.phase === "rendering"
+              ? `Rendering ${imageProgress.done}/${imageProgress.total} · Cancel`
+              : "Preparing… · Cancel"
+            : "Download all forms"}
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setDeleteOpen(true)}
+          disabled={
+            exportingImages ||
+            downloadingForms ||
+            deleting ||
+            referrals.length === 0
+          }
+          className="flex items-center justify-center gap-2 rounded-xl border border-rose-300 p-2 text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <Trash2 className="h-4 w-4" />
+          Delete all referrals
         </button>
 
         {assignmentModeActive && (
@@ -772,6 +889,57 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
         onConfirm={confirmAction}
         onCancel={() => setPendingAction(null)}
       />
+
+      {/* Delete-all dialog (typed confirmation) */}
+      {deleteOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-lg bg-white p-6 shadow-xl">
+            <h2 className="text-base font-semibold text-slate-900">
+              Delete all {referrals.length} referral
+              {referrals.length === 1 ? "" : "s"}?
+            </h2>
+            <p className="mt-2 text-sm text-slate-600">
+              This permanently removes every referral in the system, including
+              assigned ones already uploaded to LHIMS. It cannot be undone.
+              Download the images first if you need a copy.
+            </p>
+            <label className="mt-4 block text-xs text-slate-500">
+              Type <span className="font-mono font-semibold">DELETE</span> to
+              confirm
+              <input
+                value={deleteConfirmText}
+                onChange={(e) => setDeleteConfirmText(e.target.value)}
+                disabled={deleting}
+                autoComplete="off"
+                className="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:border-rose-400 focus:outline-none"
+              />
+            </label>
+            {deleting && (
+              <p className="mt-3 text-xs text-slate-500">
+                Deleted {deletedCount}…
+              </p>
+            )}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={closeDeleteDialog}
+                disabled={deleting}
+                className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={deleteEverything}
+                disabled={deleting || deleteConfirmText !== "DELETE"}
+                className="rounded-md bg-rose-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {deleting ? "Deleting…" : "Delete everything"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

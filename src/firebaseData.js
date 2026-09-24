@@ -6,6 +6,7 @@ import {
   getDoc,
   getDocs,
   increment,
+  limit,
   onSnapshot,
   query,
   runTransaction,
@@ -246,6 +247,40 @@ export async function completeReferral(referralId) {
   await batch.commit();
   invalidateCollection("referrals");
   invalidateDocument("metrics", "summary");
+}
+
+/**
+ * Permanently deletes every document in the "referrals" collection.
+ *
+ * Works in batches of 450 (under Firestore's 500-write batch limit) and
+ * re-queries until the collection is empty, so it is safe to retry if it
+ * fails partway. `onProgress(deletedSoFar)` is called after each batch.
+ * Resolves to the total number of documents deleted.
+ *
+ * Only removes Firestore documents; it does not touch files in Firebase
+ * Storage, and it does not change the `metrics/summary` counters.
+ */
+export async function deleteAllReferrals({ onProgress } = {}) {
+  if (!db) throw new Error("Firebase is not configured.");
+
+  const BATCH_SIZE = 450;
+  let deleted = 0;
+  try {
+    for (;;) {
+      const snapshot = await getDocs(
+        query(collection(db, "referrals"), limit(BATCH_SIZE)),
+      );
+      if (snapshot.empty) break;
+      const batch = writeBatch(db);
+      snapshot.docs.forEach((item) => batch.delete(item.ref));
+      await batch.commit();
+      deleted += snapshot.size;
+      onProgress?.(deleted);
+    }
+  } finally {
+    invalidateCollection("referrals");
+  }
+  return deleted;
 }
 
 export function subscribeToCollection(collectionName, onData, onError) {
