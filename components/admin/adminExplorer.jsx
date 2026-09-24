@@ -132,6 +132,11 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
     if (!assignmentModeActive) setSelectedIds([]);
   }, [assignmentModeActive]);
 
+  // A new filter or search starts from page 1.
+  useEffect(() => {
+    setPage(1);
+  }, [statusFilter, query]);
+
   useEffect(() => {
     if (!notice) return undefined;
     const timeout = setTimeout(() => setNotice(null), NOTICE_DURATION_MS);
@@ -153,6 +158,16 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
       return true;
     });
   }, [referrals, statusFilter, query]);
+
+  // Selection spans pages (that's the point of selecting a whole date), but
+  // must never include rows the current search has filtered out.
+  useEffect(() => {
+    const visible = new Set(filtered.map((referral) => referral.id));
+    setSelectedIds((current) => {
+      const next = current.filter((id) => visible.has(id));
+      return next.length === current.length ? current : next;
+    });
+  }, [filtered]);
 
   // In assignment mode, referrals are grouped by the date printed on the
   // form (referral.referralDate) rather than shown as one flat page — this
@@ -177,12 +192,35 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
       }));
   }, [filtered, assignmentModeActive]);
 
+  const allAssignableIds = useMemo(
+    () => groupedByDate.flatMap((group) => group.assignableIds),
+    [groupedByDate],
+  );
+
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const currentPage = Math.min(page, pageCount);
   const paginated = filtered.slice(
     (currentPage - 1) * PAGE_SIZE,
     currentPage * PAGE_SIZE,
   );
+
+  // Ready to assign is paginated by rows, in date order, and each page is
+  // then re-grouped by date. A date's stack can straddle a page boundary;
+  // its header checkbox still selects the whole date across every page.
+  const assignmentPageGroups = useMemo(() => {
+    if (!assignmentModeActive) return [];
+    const start = (currentPage - 1) * PAGE_SIZE;
+    const rows = groupedByDate.flatMap((group) =>
+      group.referrals.map((referral) => ({ referral, group })),
+    );
+    const pageGroups = [];
+    rows.slice(start, start + PAGE_SIZE).forEach(({ referral, group }) => {
+      const last = pageGroups[pageGroups.length - 1];
+      if (last && last.key === group.key) last.pageReferrals.push(referral);
+      else pageGroups.push({ ...group, pageReferrals: [referral] });
+    });
+    return pageGroups;
+  }, [assignmentModeActive, currentPage, groupedByDate]);
 
   const columnCount = assignmentModeActive ? 3 : 2;
 
@@ -205,6 +243,13 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
         ? current.filter((id) => !group.assignableIds.includes(id))
         : [...new Set([...current, ...group.assignableIds])],
     );
+  };
+
+  const toggleAllAssignable = () => {
+    const everythingSelected =
+      allAssignableIds.length > 0 &&
+      allAssignableIds.every((id) => selectedIds.includes(id));
+    setSelectedIds(everythingSelected ? [] : allAssignableIds);
   };
 
   const toggleCollapsed = (key) => {
@@ -376,8 +421,19 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
         </button>
 
         {assignmentModeActive && (
-          <label className="flex w-full flex-wrap items-center gap-2 text-sm text-slate-600 sm:ml-auto sm:w-auto sm:flex-nowrap">
+          <div className="flex w-full flex-wrap items-center gap-2 text-sm text-slate-600 sm:ml-auto sm:w-auto sm:flex-nowrap">
             <span>{selectedIds.length} selected</span>
+            <button
+              type="button"
+              onClick={toggleAllAssignable}
+              disabled={assigning || allAssignableIds.length === 0}
+              className="rounded-md border border-slate-300 px-3 py-1.5 text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {selectedIds.length > 0 &&
+              allAssignableIds.every((id) => selectedIds.includes(id))
+                ? "Clear selection"
+                : `Select all assignable (${allAssignableIds.length})`}
+            </button>
             <select
               disabled={
                 !selectedIds.length ||
@@ -391,6 +447,7 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
               }
               defaultValue=""
               onChange={assignSelected}
+              aria-label="Assign selected referrals to an officer"
               className="min-w-0 flex-1 rounded-md border border-slate-300 px-3 py-1.5 disabled:opacity-50 sm:flex-none"
             >
               <option value="">Assign selected to...</option>
@@ -408,15 +465,16 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                 </option>
               ))}
             </select>
-          </label>
+          </div>
         )}
       </div>
 
       {assignmentModeActive ? (
         <p className="mt-3 text-xs text-slate-400">
           Grouped by the date on the form. Tick a date's checkbox to select
-          everything in it, then assign the whole group to one officer in one
-          go.
+          every assignable referral in it (including ones on other pages), then
+          assign the whole group to one officer in one go. Your selection is
+          kept as you move between pages.
         </p>
       ) : null}
 
@@ -445,11 +503,13 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                 No referrals match these filters.
               </p>
             )}
-            {groupedByDate.map((group) => {
+            {assignmentPageGroups.map((group) => {
               const allSelected =
                 group.assignableIds.length > 0 &&
                 group.assignableIds.every((id) => selectedIds.includes(id));
               const isCollapsed = collapsedDates.has(group.key);
+              const total = group.referrals.length;
+              const onThisPage = group.pageReferrals.length;
               return (
                 <div
                   key={group.key}
@@ -478,8 +538,9 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                         {group.label}
                       </span>
                       <span className="text-xs text-slate-400">
-                        {group.referrals.length} referral
-                        {group.referrals.length === 1 ? "" : "s"}
+                        {onThisPage === total
+                          ? `${total} referral${total === 1 ? "" : "s"}`
+                          : `${onThisPage} of ${total} referrals on this page`}
                         {group.assignableIds.length
                           ? ` · ${group.assignableIds.length} assignable`
                           : " · none signed by both doctors yet"}
@@ -490,7 +551,7 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                   {!isCollapsed && (
                     <table className="w-full text-sm">
                       <tbody>
-                        {group.referrals.map((r) => (
+                        {group.pageReferrals.map((r) => (
                           <tr
                             key={r.id}
                             onClick={() => setSelected(r)}
@@ -573,7 +634,7 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
           </table>
         )}
 
-        {!loading && !assignmentModeActive && (
+        {!loading && (
           <Pagination
             page={currentPage}
             pageCount={pageCount}

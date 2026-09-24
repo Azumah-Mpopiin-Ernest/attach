@@ -8,6 +8,7 @@ import {
   increment,
   onSnapshot,
   query,
+  runTransaction,
   updateDoc,
   where,
   writeBatch,
@@ -157,6 +158,79 @@ export function updateReferral(referralId, changes) {
   return updateDoc(doc(db, "referrals", referralId), changes).then(() => {
     invalidateCollection("referrals");
   });
+}
+
+/**
+ * Updates many referrals safely, re-validating each one against its
+ * *current* server state inside a transaction.
+ *
+ * `buildChanges(freshReferral)` must return the changes to write, or throw
+ * to skip that referral (e.g. another doctor already signed it). A skipped
+ * referral never blocks the others.
+ *
+ * Referrals are processed in chunks of `chunkSize`; each chunk commits
+ * atomically. Firestore caps a transaction at 500 writes / 10 MiB.
+ *
+ * Resolves to { applied: [{ id, changes }], skipped: [{ id, reason }] }.
+ * If a chunk fails outright, the thrown error carries `applied` and
+ * `skipped` for the chunks that already committed.
+ */
+export async function updateReferralsTransaction(
+  referralIds,
+  buildChanges,
+  { chunkSize = 100 } = {},
+) {
+  if (!db) throw new Error("Firebase is not configured.");
+
+  const ids = [...new Set(referralIds)];
+  const size = Math.max(1, Math.min(chunkSize, 400));
+  const applied = [];
+  const skipped = [];
+
+  try {
+    for (let start = 0; start < ids.length; start += size) {
+      const chunk = ids.slice(start, start + size);
+      // The transaction callback may re-run on contention, so it must only
+      // build local results; they're merged after a successful commit.
+      const result = await runTransaction(db, async (transaction) => {
+        const snapshots = await Promise.all(
+          chunk.map((id) => transaction.get(doc(db, "referrals", id))),
+        );
+        const chunkApplied = [];
+        const chunkSkipped = [];
+
+        snapshots.forEach((snapshot, index) => {
+          const id = chunk[index];
+          if (!snapshot.exists()) {
+            chunkSkipped.push({
+              id,
+              reason: "This referral no longer exists.",
+            });
+            return;
+          }
+          try {
+            const changes = buildChanges({ id, ...snapshot.data() });
+            transaction.update(snapshot.ref, changes);
+            chunkApplied.push({ id, changes });
+          } catch (validationError) {
+            chunkSkipped.push({ id, reason: validationError.message });
+          }
+        });
+
+        return { applied: chunkApplied, skipped: chunkSkipped };
+      });
+      applied.push(...result.applied);
+      skipped.push(...result.skipped);
+    }
+  } catch (error) {
+    error.applied = applied;
+    error.skipped = skipped;
+    throw error;
+  } finally {
+    invalidateCollection("referrals");
+  }
+
+  return { applied, skipped };
 }
 
 export async function completeReferral(referralId) {
