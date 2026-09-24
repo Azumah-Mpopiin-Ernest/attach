@@ -7,7 +7,10 @@ const FORM_WIDTH = 1600;
 const FORM_HEIGHT = 1067;
 const FORM_ASPECT = FORM_WIDTH / FORM_HEIGHT; // ~1.4995
 
-// --- Single-form render (unchanged drawing logic, just no longer downloads) ---
+// --- Single-form render ---
+// THIS IS THE ONLY DEFINITION OF THE REFERRAL FORM DESIGN. Every download in
+// the system (officer single JPEG, admin print-sheet PDFs, admin PNG ZIP)
+// goes through this function, so the form looks identical everywhere.
 export async function renderReferralFormCanvas(referral) {
   const canvas = document.createElement("canvas");
   canvas.width = FORM_WIDTH;
@@ -108,7 +111,25 @@ export async function renderReferralFormCanvas(referral) {
   return canvas;
 }
 
-// --- Single-form download (used by OfficerApp — unchanged behavior) ---
+// --- PNG bytes of the same form (used by the admin "Download all forms" ZIP) ---
+export async function renderReferralFormPngBytes(referral) {
+  const canvas = await renderReferralFormCanvas(referral);
+  try {
+    const blob = await new Promise((resolve, reject) =>
+      canvas.toBlob(
+        (b) => (b ? resolve(b) : reject(new Error("Could not encode image."))),
+        "image/png",
+      ),
+    );
+    return new Uint8Array(await blob.arrayBuffer());
+  } finally {
+    // Release the bitmap right away (matters on Safari and big batches).
+    canvas.width = 0;
+    canvas.height = 0;
+  }
+}
+
+// --- Single-form download (used by OfficerApp) ---
 export async function downloadReferralForm(referral) {
   const canvas = await renderReferralFormCanvas(referral);
   const blob = await new Promise((resolve) =>
@@ -255,16 +276,17 @@ function defaultZipFileName() {
   return `referral-forms-${today}.zip`;
 }
 
-// --- Existing helpers, unchanged ---
+const INK_FONT_FAMILY = "Arial, Helvetica, sans-serif";
+const measureContext = document.createElement("canvas").getContext("2d");
+
 function inkFontFor(value, maxWidth) {
-  const fontSizes = [48, 46, 44, 42, 40, 38, 36, 34, 32];
+  const fontSizes = [40, 38, 36, 34, 32, 30, 28, 26];
   for (const size of fontSizes) {
-    const font = `bold ${size}px "Segoe Print", "Bradley Hand", "Comic Sans MS", cursive`;
-    const measureContext = document.createElement("canvas").getContext("2d");
+    const font = `bold ${size}px ${INK_FONT_FAMILY}`;
     measureContext.font = font;
     if (measureContext.measureText(value).width <= maxWidth) return font;
   }
-  return 'bold 30px "Segoe Print", "Bradley Hand", "Comic Sans MS", cursive';
+  return `bold 24px ${INK_FONT_FAMILY}`;
 }
 
 function nameOf(referral) {
@@ -289,14 +311,30 @@ function safeFileName(value) {
   );
 }
 
+// Every referral signed by the same doctor shares one signature image (and
+// every form shares the logo), so each distinct URL is loaded and decoded
+// once instead of once per form. A failed load is not cached, so a transient
+// network error doesn't stick for the rest of the session.
+const imageCache = new Map();
+
 function loadImage(source) {
-  return new Promise((resolve) => {
-    const image = new Image();
-    image.crossOrigin = "anonymous";
-    image.onload = () => resolve(image);
-    image.onerror = () => resolve(null);
-    image.src = source;
-  });
+  if (!source) return Promise.resolve(null);
+  if (!imageCache.has(source)) {
+    imageCache.set(
+      source,
+      new Promise((resolve) => {
+        const image = new Image();
+        image.crossOrigin = "anonymous";
+        image.onload = () => resolve(image);
+        image.onerror = () => {
+          imageCache.delete(source);
+          resolve(null);
+        };
+        image.src = source;
+      }),
+    );
+  }
+  return imageCache.get(source);
 }
 
 async function drawSignature(context, source, x, y, width, height) {
@@ -368,6 +406,10 @@ async function drawSignature(context, source, x, y, width, height) {
   );
   context.globalAlpha = 1;
   context.restore();
+
+  // Free the temporary bitmap immediately (matters in large batches).
+  signatureCanvas.width = 0;
+  signatureCanvas.height = 0;
 }
 
 function seededJitter(source) {
@@ -385,7 +427,18 @@ function seededJitter(source) {
   };
 }
 
+// The opaque-pixel scan is the slowest part of drawing a signature, and the
+// result only depends on the image, so compute it once per image.
+const boundsCache = new WeakMap();
+
 function opaqueBounds(image) {
+  if (boundsCache.has(image)) return boundsCache.get(image);
+  const bounds = computeOpaqueBounds(image);
+  boundsCache.set(image, bounds);
+  return bounds;
+}
+
+function computeOpaqueBounds(image) {
   const canvas = document.createElement("canvas");
   canvas.width = image.naturalWidth || image.width;
   canvas.height = image.naturalHeight || image.height;

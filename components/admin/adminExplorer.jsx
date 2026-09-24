@@ -307,6 +307,10 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
 
   // Deliberately NOT async, and nothing is awaited before the call: the
   // browser's "save as" dialog needs the click's user activation.
+  //
+  // No `renderForm` is passed on purpose: the export uses the shared form
+  // renderer from referralForm.js, so these PNGs are identical to the
+  // officer's download and the print sheets.
   const downloadAllImages = () => {
     const controller = new AbortController();
     exportAbort.current = controller;

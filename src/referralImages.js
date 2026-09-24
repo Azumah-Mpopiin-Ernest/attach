@@ -1,6 +1,12 @@
 import { Zip, ZipPassThrough } from "fflate";
+import { renderReferralFormPngBytes } from "./referralForm";
 
 // Exports every referral as its own PNG inside a single ZIP.
+//
+// The form design itself lives in ONE place: referralForm.js
+// (renderReferralFormCanvas). This module only handles bulk delivery, so
+// every form in the ZIP is identical to the officer's single download and
+// the admin print sheets.
 //
 // Built for thousands of forms: images are rendered a few at a time and
 // streamed into the archive, and (in browsers that support it) the archive is
@@ -10,260 +16,14 @@ import { Zip, ZipPassThrough } from "fflate";
 //
 //   npm install fflate
 
-const FORM_WIDTH_MM = 150;
-const FORM_HEIGHT_MM = 100;
-const DEFAULT_DPI = 300;
 const DEFAULT_CONCURRENCY = 4;
 // Only used by the fallback path (no File System Access API): the export is
 // split into several ZIPs of this many images so no single archive has to fit
 // in memory.
 const FALLBACK_PART_SIZE = 500;
 
-const FONT = "Arial, Helvetica, sans-serif";
-const MONO = '"Courier New", Courier, monospace';
-const INK = "#0f172a";
-const MUTED = "#64748b";
-const RULE = "#cbd5e1";
-
 function abortError() {
   return new DOMException("Export cancelled.", "AbortError");
-}
-
-/* ------------------------------------------------------------------ *
- * Rendering
- * ------------------------------------------------------------------ */
-
-const imageCache = new Map();
-
-// Every referral signed by the same doctor shares one signature image, so
-// decode each distinct URL once instead of thousands of times.
-function loadImage(url) {
-  if (!url) return Promise.resolve(null);
-  if (!imageCache.has(url)) {
-    imageCache.set(
-      url,
-      new Promise((resolve) => {
-        const image = new Image();
-        image.crossOrigin = "anonymous"; // hosted signatures need CORS enabled
-        image.onload = () => resolve(image);
-        image.onerror = () => resolve(null);
-        image.src = url;
-      }),
-    );
-  }
-  return imageCache.get(url);
-}
-
-function toDate(value) {
-  if (!value) return null;
-  if (typeof value.toDate === "function") return value.toDate();
-  if (value instanceof Date) return value;
-  if (typeof value === "number")
-    return new Date(Date.UTC(1899, 11, 30) + value * 86400000);
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
-}
-
-function formatDate(value) {
-  const date = toDate(value);
-  return date ? date.toLocaleDateString("en-GB") : "";
-}
-
-function fitFont(ctx, text, weight, family, size, minSize, maxWidth) {
-  let current = size;
-  ctx.font = `${weight} ${current}px ${family}`;
-  while (current > minSize && ctx.measureText(text).width > maxWidth) {
-    current -= size * 0.04;
-    ctx.font = `${weight} ${current}px ${family}`;
-  }
-  return current;
-}
-
-function wrapLines(ctx, text, maxWidth, maxLines) {
-  const words = String(text).split(/\s+/).filter(Boolean);
-  const lines = [];
-  let line = "";
-  for (const word of words) {
-    const candidate = line ? `${line} ${word}` : word;
-    if (ctx.measureText(candidate).width <= maxWidth || !line) {
-      line = candidate;
-    } else {
-      lines.push(line);
-      line = word;
-    }
-  }
-  if (line) lines.push(line);
-  if (lines.length > maxLines) {
-    const kept = lines.slice(0, maxLines);
-    let last = kept[maxLines - 1];
-    while (last.length > 1 && ctx.measureText(`${last}…`).width > maxWidth) {
-      last = last.slice(0, -1);
-    }
-    kept[maxLines - 1] = `${last}…`;
-    return kept;
-  }
-  return lines;
-}
-
-/**
- * Draws one referral onto a 150mm x 100mm landscape canvas and returns PNG
- * bytes. This is a self-contained layout; to match your official form
- * exactly, pass your own `renderForm(referral) => Promise<Uint8Array>` to
- * `downloadAllReferralImagesZip`.
- */
-export async function renderReferralFormPng(
-  referral,
-  { dpi = DEFAULT_DPI } = {},
-) {
-  const u = dpi / 25.4; // pixels per millimetre
-  const m = (mm) => mm * u;
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.round(m(FORM_WIDTH_MM));
-  canvas.height = Math.round(m(FORM_HEIGHT_MM));
-  const ctx = canvas.getContext("2d");
-
-  const [fromImage, toImage] = await Promise.all([
-    loadImage(referral.referredFromSignatureUrl),
-    loadImage(referral.referredToSignatureUrl),
-  ]);
-
-  const text = (value, x, y, opts = {}) => {
-    const {
-      size = 3.4,
-      weight = "400",
-      family = FONT,
-      color = INK,
-      align = "left",
-      maxWidth,
-      italic = false,
-    } = opts;
-    const style = italic ? "italic " : "";
-    let px = m(size);
-    ctx.font = `${style}${weight} ${px}px ${family}`;
-    if (maxWidth) {
-      px = fitFont(ctx, value, weight, family, px, m(size * 0.6), m(maxWidth));
-      ctx.font = `${style}${weight} ${px}px ${family}`;
-    }
-    ctx.fillStyle = color;
-    ctx.textAlign = align;
-    ctx.textBaseline = "alphabetic";
-    ctx.fillText(value, m(x), m(y));
-  };
-
-  const rule = (x1, x2, y, color = RULE, width = 0.25) => {
-    ctx.strokeStyle = color;
-    ctx.lineWidth = m(width);
-    ctx.beginPath();
-    ctx.moveTo(m(x1), m(y));
-    ctx.lineTo(m(x2), m(y));
-    ctx.stroke();
-  };
-
-  const field = (label, value, x, y, maxWidth, family = FONT) => {
-    text(label, x, y, { size: 2.4, color: MUTED });
-    text(value || "—", x, y + 5.4, {
-      size: 3.9,
-      weight: "600",
-      family,
-      maxWidth,
-    });
-  };
-
-  const signatureBlock = (title, doctorName, signedAt, image, x) => {
-    const areaWidth = 58;
-    const areaHeight = 13;
-    const baseline = 81.5;
-    text(title, x, 64, { size: 2.4, color: MUTED });
-    if (image) {
-      const scale = Math.min(
-        m(areaWidth) / image.width,
-        m(areaHeight) / image.height,
-      );
-      const drawWidth = image.width * scale;
-      const drawHeight = image.height * scale;
-      ctx.drawImage(
-        image,
-        m(x),
-        m(baseline - 0.8) - drawHeight,
-        drawWidth,
-        drawHeight,
-      );
-    } else {
-      text(doctorName ? "Signature unavailable" : "Awaiting signature", x, 76, {
-        size: 3,
-        color: MUTED,
-        italic: true,
-      });
-    }
-    rule(x, x + areaWidth, baseline, INK, 0.3);
-    text(doctorName || "—", x, 86, {
-      size: 3.2,
-      weight: "600",
-      maxWidth: areaWidth,
-    });
-    const signed = formatDate(signedAt);
-    if (signed) text(`Signed ${signed}`, x, 90.3, { size: 2.4, color: MUTED });
-  };
-
-  // Page and frame
-  ctx.fillStyle = "#ffffff";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.strokeStyle = INK;
-  ctx.lineWidth = m(0.35);
-  ctx.strokeRect(m(4), m(4), m(142), m(92));
-
-  // Header
-  text("REFERRAL FORM", 9, 13, { size: 4.4, weight: "700" });
-  text(referral.patientId ?? "", 141, 13, {
-    size: 3.4,
-    family: MONO,
-    color: MUTED,
-    align: "right",
-    maxWidth: 60,
-  });
-  rule(9, 141, 17.5);
-
-  // Patient details
-  field("Patient name", referral.name ?? referral.patientName, 9, 24, 78);
-  field("NHIS number", referral.nhis, 95, 24, 46, MONO);
-  field("Patient ID", referral.patientId, 9, 37, 78, MONO);
-  field("Referral date", formatDate(referral.referralDate), 95, 37, 46);
-
-  // Reason
-  text("Reason for referral", 9, 49, { size: 2.4, color: MUTED });
-  const reason = referral.reason ?? referral.referralReason ?? "";
-  ctx.font = `400 ${m(3.3)}px ${FONT}`;
-  wrapLines(ctx, reason || "—", m(132), 3).forEach((line, index) => {
-    text(line, 9, 54.5 + index * 4.4, { size: 3.3 });
-  });
-
-  // Signatures
-  signatureBlock(
-    "Referred From",
-    referral.referredFromDoctorName,
-    referral.referredFromSignedAt,
-    fromImage,
-    9,
-  );
-  signatureBlock(
-    "Referred To",
-    referral.referredToDoctorName,
-    referral.referredToSignedAt,
-    toImage,
-    83,
-  );
-
-  const blob = await new Promise((resolve, reject) =>
-    canvas.toBlob(
-      (result) =>
-        result ? resolve(result) : reject(new Error("Could not encode image.")),
-      "image/png",
-    ),
-  );
-  const bytes = new Uint8Array(await blob.arrayBuffer());
-  canvas.width = 0; // release the bitmap right away (matters on Safari)
-  canvas.height = 0;
-  return bytes;
 }
 
 /* ------------------------------------------------------------------ *
@@ -382,7 +142,9 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * Options:
  *   loadReferrals  () => Promise<referral[]>   (or pass `referrals` directly)
  *   renderForm     (referral) => Promise<Uint8Array PNG>; defaults to the
- *                  built-in layout above
+ *                  shared form renderer in referralForm.js. Only override
+ *                  this for tests — overriding it makes the exported forms
+ *                  differ from every other download in the system.
  *   onProgress     ({ phase: "loading" | "rendering", done, total, failed })
  *   signal         AbortSignal to cancel
  *
@@ -393,8 +155,7 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export async function downloadAllReferralImagesZip({
   loadReferrals,
   referrals: providedReferrals,
-  renderForm,
-  dpi = DEFAULT_DPI,
+  renderForm = renderReferralFormPngBytes,
   concurrency = DEFAULT_CONCURRENCY,
   partSize = FALLBACK_PART_SIZE,
   fileName = "referral-forms",
@@ -433,8 +194,6 @@ export async function downloadAllReferralImagesZip({
   if (!referrals.length) throw new Error("There are no referrals to export.");
   if (signal?.aborted) throw abortError();
 
-  const render =
-    renderForm ?? ((referral) => renderReferralFormPng(referral, { dpi }));
   const used = new Set();
   const items = referrals.map((referral) => ({
     referral,
@@ -451,61 +210,57 @@ export async function downloadAllReferralImagesZip({
   };
   onProgress?.({ phase: "rendering", done: 0, total, failed: 0 });
 
-  const options = { render, concurrency, signal, onItem };
+  const options = { render: renderForm, concurrency, signal, onItem };
   const failed = [];
 
-  try {
-    if (fileHandle) {
-      // Stream straight to disk: memory use does not grow with the archive.
-      const writable = await fileHandle.createWritable();
-      try {
-        failed.push(
-          ...(await buildZip(
-            items,
-            { write: (chunk) => writable.write(chunk) },
-            options,
-          )),
-        );
-        await writable.close();
-      } catch (error) {
-        await writable.abort().catch(() => {}); // leaves any existing file untouched
-        throw error;
-      }
-      return {
-        written: total - failed.length,
-        failed,
-        parts: 1,
-        method: "file",
-      };
-    }
-
-    // Fallback: several smaller ZIPs, each built in memory and downloaded.
-    const parts = Math.ceil(total / partSize);
-    for (let part = 0; part < parts; part += 1) {
-      const chunks = [];
-      const slice = items.slice(part * partSize, (part + 1) * partSize);
+  if (fileHandle) {
+    // Stream straight to disk: memory use does not grow with the archive.
+    const writable = await fileHandle.createWritable();
+    try {
       failed.push(
         ...(await buildZip(
-          slice,
-          { write: async (chunk) => void chunks.push(chunk) },
+          items,
+          { write: (chunk) => writable.write(chunk) },
           options,
         )),
       );
-      triggerDownload(
-        new Blob(chunks, { type: "application/zip" }),
-        parts === 1
-          ? `${baseName}.zip`
-          : `${baseName}-part-${part + 1}-of-${parts}.zip`,
-      );
-      if (part < parts - 1) await pause(600); // let the browser accept each download
+      await writable.close();
+    } catch (error) {
+      await writable.abort().catch(() => {}); // leaves any existing file untouched
+      throw error;
     }
     return {
       written: total - failed.length,
       failed,
-      parts,
-      method: "downloads",
+      parts: 1,
+      method: "file",
     };
-  } finally {
-    imageCache.clear();
   }
+
+  // Fallback: several smaller ZIPs, each built in memory and downloaded.
+  const parts = Math.ceil(total / partSize);
+  for (let part = 0; part < parts; part += 1) {
+    const chunks = [];
+    const slice = items.slice(part * partSize, (part + 1) * partSize);
+    failed.push(
+      ...(await buildZip(
+        slice,
+        { write: async (chunk) => void chunks.push(chunk) },
+        options,
+      )),
+    );
+    triggerDownload(
+      new Blob(chunks, { type: "application/zip" }),
+      parts === 1
+        ? `${baseName}.zip`
+        : `${baseName}-part-${part + 1}-of-${parts}.zip`,
+    );
+    if (part < parts - 1) await pause(600); // let the browser accept each download
+  }
+  return {
+    written: total - failed.length,
+    failed,
+    parts,
+    method: "downloads",
+  };
 }
