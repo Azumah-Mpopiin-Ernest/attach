@@ -57,6 +57,7 @@ export default function DoctorApp({
       {activePage === "profile" && (
         <DoctorProfile
           existingSignatureUrl={signatureDataUrl ?? profile?.signaturePngUrl}
+          existingName={profile?.fullName}
         />
       )}
 

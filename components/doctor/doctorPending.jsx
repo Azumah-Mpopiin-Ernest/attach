@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
   Loader2,
   Search,
+  X,
 } from "lucide-react";
 import {
   subscribeToReferrals,
@@ -13,10 +14,14 @@ import {
 
 const PAGE_SIZE = 25;
 const MAX_BATCH = 100;
+const SEARCH_DEBOUNCE_MS = 200;
 // Firestore caps a transaction at 10 MiB. Signature data URLs are copied onto
 // every referral, so large inline signatures shrink the chunk size.
 const TRANSACTION_BYTE_BUDGET = 6_000_000;
 const MAX_INLINE_SIGNATURE_CHARS = 700_000; // a Firestore document is 1 MiB max
+// statusHistory is append-only by nature; cap it so it can't keep growing a
+// document toward the 1 MiB Firestore limit as a referral gets re-touched.
+const MAX_STATUS_HISTORY_ENTRIES = 20;
 
 export default function DoctorPending({
   doctorId,
@@ -26,6 +31,7 @@ export default function DoctorPending({
   onSigned,
 }) {
   const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
   const [referrals, setReferrals] = useState([]);
   const [loadError, setLoadError] = useState("");
   const [message, setMessage] = useState(null); // { type: "error" | "warning", text }
@@ -35,6 +41,7 @@ export default function DoctorPending({
   const [signingIds, setSigningIds] = useState([]);
   const [signatureSide, setSignatureSide] = useState("from");
   const [queueTab, setQueueTab] = useState("unsigned");
+  const [confirmState, setConfirmState] = useState(null); // { items, sideLabel }
 
   const isSigning = signingIds.length > 0;
 
@@ -51,6 +58,16 @@ export default function DoctorPending({
       },
     );
   }, []);
+
+  // Debounce search input so filtering/sorting a large referral set doesn't
+  // re-run on every keystroke.
+  useEffect(() => {
+    const handle = setTimeout(
+      () => setDebouncedQuery(query),
+      SEARCH_DEBOUNCE_MS,
+    );
+    return () => clearTimeout(handle);
+  }, [query]);
 
   const eligibleReferrals = useMemo(() => {
     if (!doctorId) return { unsigned: [], needsOtherSignature: [] };
@@ -72,7 +89,7 @@ export default function DoctorPending({
   }, [doctorId, referrals]);
 
   const filtered = useMemo(() => {
-    const needle = query.toLowerCase();
+    const needle = debouncedQuery.toLowerCase();
     return eligibleReferrals[queueTab]
       .slice()
       .sort((a, b) =>
@@ -85,7 +102,7 @@ export default function DoctorPending({
           .toLowerCase()
           .includes(needle),
       );
-  }, [eligibleReferrals, query, queueTab]);
+  }, [eligibleReferrals, debouncedQuery, queueTab]);
 
   // Only ever act on what the doctor can see: when the tab or search changes,
   // or another doctor signs something, drop selections that are no longer
@@ -100,7 +117,19 @@ export default function DoctorPending({
 
   useEffect(() => {
     setPage(1);
-  }, [queueTab, query]);
+  }, [queueTab, debouncedQuery]);
+
+  // If a confirm dialog is open against a batch that just changed under it
+  // (someone else signed one, or the visible set changed), close it rather
+  // than let a stale confirmation fire against different items.
+  useEffect(() => {
+    if (!confirmState) return;
+    const visible = new Set(filtered.map((item) => item.id));
+    const stillValid =
+      confirmState.items.length > 0 &&
+      confirmState.items.every((item) => visible.has(item.id));
+    if (!stillValid) setConfirmState(null);
+  }, [filtered, confirmState]);
 
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const currentPage = Math.min(page, pageCount);
@@ -160,45 +189,9 @@ export default function DoctorPending({
         ? "Referred From doctor"
         : "Referred To doctor";
 
-  const approveAndSign = async (items) => {
-    if (isSigning) return;
-    if (!items.length) {
-      setMessage({
-        type: "error",
-        text: "Select at least one referral before approving and signing.",
-      });
-      return;
-    }
-    if (!doctorId || !doctorName) {
-      setMessage({
-        type: "error",
-        text: "Your doctor account is still loading. Please try again shortly.",
-      });
-      return;
-    }
-    if (!signatureUrl) {
-      setMessage({
-        type: "error",
-        text: "You have not uploaded a signature yet. Upload it from your Profile before signing referrals.",
-      });
-      return;
-    }
-    if (signatureUrl.length > MAX_INLINE_SIGNATURE_CHARS) {
-      setMessage({
-        type: "error",
-        text: "Your signature image is too large to attach to referrals. Upload a smaller image from your Profile.",
-      });
-      return;
-    }
-    if (
-      items.length > 1 &&
-      !window.confirm(
-        `Sign ${items.length} referrals as ${sideLabel}? This can't be undone.`,
-      )
-    ) {
-      return;
-    }
-
+  // The actual signing transaction. Assumes validation already happened in
+  // requestSign — never call this directly from the UI.
+  const performSign = async (items) => {
     const ids = items.map((item) => item.id);
     const chunkSize = Math.max(
       1,
@@ -258,8 +251,55 @@ export default function DoctorPending({
     }
   };
 
+  // Validates, then either signs immediately (single item) or opens a
+  // confirm dialog (multi-item) before calling performSign.
+  const requestSign = (items) => {
+    if (isSigning) return;
+    if (!items.length) {
+      setMessage({
+        type: "error",
+        text: "Select at least one referral before approving and signing.",
+      });
+      return;
+    }
+    if (!doctorId || !doctorName) {
+      setMessage({
+        type: "error",
+        text: "Your doctor account is still loading. Please try again shortly.",
+      });
+      return;
+    }
+    if (!signatureUrl) {
+      setMessage({
+        type: "error",
+        text: "You have not uploaded a signature yet. Upload it from your Profile before signing referrals.",
+      });
+      return;
+    }
+    if (signatureUrl.length > MAX_INLINE_SIGNATURE_CHARS) {
+      setMessage({
+        type: "error",
+        text: "Your signature image is too large to attach to referrals. Upload a smaller image from your Profile.",
+      });
+      return;
+    }
+
+    if (items.length > 1) {
+      setConfirmState({ items, sideLabel });
+      return;
+    }
+    performSign(items);
+  };
+
+  const confirmPendingSign = () => {
+    if (!confirmState) return;
+    const { items } = confirmState;
+    setConfirmState(null);
+    performSign(items);
+  };
+
   // One click: sign the oldest MAX_BATCH referrals in the current tab/search.
-  const signFirstBatch = () => approveAndSign(filtered.slice(0, MAX_BATCH));
+  const signFirstBatch = () => requestSign(filtered.slice(0, MAX_BATCH));
 
   return (
     <div>
@@ -349,7 +389,7 @@ export default function DoctorPending({
             <button
               type="button"
               disabled={!selectedItems.length || isSigning}
-              onClick={() => approveAndSign(selectedItems)}
+              onClick={() => requestSign(selectedItems)}
               className="inline-flex items-center gap-1.5 rounded-md bg-[#2F6F62] px-4 py-2 text-sm font-medium text-white hover:bg-[#265a50] disabled:cursor-not-allowed disabled:opacity-50"
             >
               {isSigning ? (
@@ -525,7 +565,7 @@ export default function DoctorPending({
                       <button
                         type="button"
                         disabled={isSigning}
-                        onClick={() => approveAndSign([referral])}
+                        onClick={() => requestSign([referral])}
                         className="inline-flex items-center gap-1.5 rounded-md bg-[#2F6F62] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#265a50] disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         {signingIds.includes(referral.id) ? (
@@ -544,6 +584,82 @@ export default function DoctorPending({
             </table>
           </div>
         ))}
+
+      {confirmState && (
+        <ConfirmSignDialog
+          count={confirmState.items.length}
+          sideLabel={confirmState.sideLabel}
+          onCancel={() => setConfirmState(null)}
+          onConfirm={confirmPendingSign}
+        />
+      )}
+    </div>
+  );
+}
+
+function ConfirmSignDialog({ count, sideLabel, onCancel, onConfirm }) {
+  const cancelRef = useRef(null);
+
+  useEffect(() => {
+    cancelRef.current?.focus();
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") onCancel();
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onCancel]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 px-4"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onCancel();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-sign-title"
+        className="w-full max-w-sm rounded-lg bg-white p-5 shadow-xl"
+      >
+        <div className="flex items-start justify-between gap-4">
+          <h2
+            id="confirm-sign-title"
+            className="text-base font-semibold text-slate-900"
+          >
+            Confirm signature
+          </h2>
+          <button
+            type="button"
+            onClick={onCancel}
+            aria-label="Cancel"
+            className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <p className="mt-2 text-sm text-slate-600">
+          Sign {count} referral{count === 1 ? "" : "s"} as {sideLabel}? This
+          can't be undone.
+        </p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            ref={cancelRef}
+            type="button"
+            onClick={onCancel}
+            className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-600 hover:bg-slate-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            className="rounded-md bg-[#2F6F62] px-4 py-2 text-sm font-medium text-white hover:bg-[#265a50]"
+          >
+            Sign {count}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -668,6 +784,6 @@ function buildSignChanges(
         text: `${doctorName} signed as Referred ${isFrom ? "From" : "To"}`,
         at: now.toISOString(),
       },
-    ],
+    ].slice(-MAX_STATUS_HISTORY_ENTRIES),
   };
 }

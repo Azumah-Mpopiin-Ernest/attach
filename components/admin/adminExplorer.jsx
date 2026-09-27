@@ -9,6 +9,7 @@ import {
   ChevronRight,
   Download,
   Trash2,
+  Loader2,
 } from "lucide-react";
 import StatusChip from "./statusChip";
 import ConfirmDialog from "./confirmDialog";
@@ -78,6 +79,8 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
   const [selectedIds, setSelectedIds] = useState([]);
   const [officers, setOfficers] = useState([]);
   const [assigning, setAssigning] = useState(false);
+  const [pendingAssignment, setPendingAssignment] = useState(null); // { assignedTo, count }
+  const assignSelectRef = useRef(null);
   const [page, setPage] = useState(1);
   const [collapsedDates, setCollapsedDates] = useState(() => new Set());
   const [downloadingForms, setDownloadingForms] = useState(false);
@@ -360,7 +363,10 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
     setDeleting(true);
     setDeletedCount(0);
     try {
-      const count = await deleteAllReferrals({ onProgress: setDeletedCount });
+      const count = await deleteAllReferrals({
+        onProgress: setDeletedCount,
+        confirm: true,
+      });
       setReferrals(await getReferrals({ force: true }));
       setSelectedIds([]);
       setSelected(null);
@@ -383,9 +389,29 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
     }
   };
 
-  const assignSelected = async (event) => {
+  // Selecting an officer opens a confirmation instead of assigning right
+  // away — bulk assignment can move a whole day's worth of referrals off
+  // the Ready to assign queue in one action, so it deserves a deliberate
+  // "yes, do this" step rather than firing on the change event alone.
+  const handleAssignSelectChange = (event) => {
     const assignedTo = event.target.value;
     if (!assignedTo || !selectedIds.length) return;
+    setPendingAssignment({ assignedTo, count: selectedIds.length });
+  };
+
+  const resetAssignSelect = () => {
+    if (assignSelectRef.current) assignSelectRef.current.value = "";
+  };
+
+  const cancelAssignment = () => {
+    setPendingAssignment(null);
+    resetAssignSelect();
+  };
+
+  const confirmAssignment = async () => {
+    if (!pendingAssignment) return;
+    const { assignedTo } = pendingAssignment;
+    setPendingAssignment(null);
     setAssigning(true);
     try {
       const currentReferrals = await getReferrals({ force: true });
@@ -423,7 +449,7 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
       showNotice("error", assignmentError.message);
     } finally {
       setAssigning(false);
-      event.target.value = "";
+      resetAssignSelect();
     }
   };
 
@@ -565,9 +591,11 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                 : `Select all assignable (${allAssignableIds.length})`}
             </button>
             <select
+              ref={assignSelectRef}
               disabled={
                 !selectedIds.length ||
                 assigning ||
+                Boolean(pendingAssignment) ||
                 selectedIds.some(
                   (id) =>
                     !isAssignableReferral(
@@ -576,7 +604,7 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                 )
               }
               defaultValue=""
-              onChange={assignSelected}
+              onChange={handleAssignSelectChange}
               aria-label="Assign selected referrals to an officer"
               className="min-w-0 flex-1 rounded-md border border-slate-300 px-3 py-1.5 disabled:opacity-50 sm:flex-none"
             >
@@ -595,6 +623,12 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                 </option>
               ))}
             </select>
+            {assigning && (
+              <span className="flex items-center gap-1.5 text-xs text-slate-500">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                Assigning...
+              </span>
+            )}
           </div>
         )}
       </div>
@@ -901,6 +935,18 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
         tone={pendingAction?.type === "revert" ? "danger" : "default"}
         onConfirm={confirmAction}
         onCancel={() => setPendingAction(null)}
+      />
+
+      <ConfirmDialog
+        open={Boolean(pendingAssignment)}
+        title={
+          pendingAssignment &&
+          `Assign ${pendingAssignment.count} referral${pendingAssignment.count === 1 ? "" : "s"} to ${pendingAssignment.assignedTo}?`
+        }
+        description="They'll be able to download and attach these forms to LHIMS."
+        confirmLabel="Assign"
+        onConfirm={confirmAssignment}
+        onCancel={cancelAssignment}
       />
 
       {/* Delete-all dialog (typed confirmation) */}

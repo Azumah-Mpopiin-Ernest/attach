@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   UploadCloud,
   FileSpreadsheet,
@@ -6,11 +6,21 @@ import {
   AlertTriangle,
 } from "lucide-react";
 import * as XLSX from "xlsx";
-import { createDocuments } from "../../src/firebaseData";
+import ConfirmDialog from "./confirmDialog";
+import {
+  createDocuments,
+  finishImportBatch,
+  getImportBatchFileNames,
+  markFileImported,
+} from "../../src/firebaseData";
 
 // Stages: "select" -> "review" -> "importing" -> "done"
-// Replace parseExcelFile / commitBatches with real SheetJS parsing and
-// chunked Firestore batched writes (<=450 docs/batch per the build spec).
+//
+// batchFiles tracks every filename successfully imported since the last
+// time "Done" was clicked (persisted in meta/currentImportBatch so it
+// survives a page refresh mid-batch). It's what powers the duplicate-file
+// warning and the "Done" button below — see firebaseData.js for why this
+// is scoped to the current batch only, not tracked forever.
 
 export default function AdminIntake() {
   const [stage, setStage] = useState("select");
@@ -22,8 +32,18 @@ export default function AdminIntake() {
   const [error, setError] = useState("");
   const inputRef = useRef(null);
 
-  const handleFile = useCallback(async (file) => {
-    if (!file) return;
+  const [batchFiles, setBatchFiles] = useState([]);
+  const [pendingDuplicateFile, setPendingDuplicateFile] = useState(null);
+  const [finishing, setFinishing] = useState(false);
+  const [pendingFinish, setPendingFinish] = useState(false);
+
+  useEffect(() => {
+    getImportBatchFileNames()
+      .then(setBatchFiles)
+      .catch((loadError) => setError(loadError.message));
+  }, []);
+
+  const processFile = useCallback(async (file) => {
     setError("");
     setFileName(file.name);
     if (!/\.(xlsx|xls|csv)$/i.test(file.name)) {
@@ -58,6 +78,29 @@ export default function AdminIntake() {
     setStage("review");
   }, []);
 
+  const handleFile = useCallback(
+    (file) => {
+      if (!file) return;
+      if (batchFiles.includes(file.name)) {
+        setPendingDuplicateFile(file);
+        return;
+      }
+      processFile(file);
+    },
+    [batchFiles, processFile],
+  );
+
+  const confirmDuplicateImport = () => {
+    const file = pendingDuplicateFile;
+    setPendingDuplicateFile(null);
+    if (file) processFile(file);
+  };
+
+  const cancelDuplicateImport = () => {
+    setPendingDuplicateFile(null);
+    if (inputRef.current) inputRef.current.value = "";
+  };
+
   const onDrop = useCallback(
     (e) => {
       e.preventDefault();
@@ -83,7 +126,11 @@ export default function AdminIntake() {
         createdAt: new Date(),
       })),
     )
+      .then(() => markFileImported(fileName))
       .then(() => {
+        setBatchFiles((current) =>
+          current.includes(fileName) ? current : [...current, fileName],
+        );
         setProgress(validRows.length);
         setStage("done");
       })
@@ -91,7 +138,7 @@ export default function AdminIntake() {
         setError(writeError.message);
         setStage("review");
       });
-  }, [validRows]);
+  }, [validRows, fileName]);
 
   const reset = () => {
     setStage("select");
@@ -99,6 +146,23 @@ export default function AdminIntake() {
     setProgress(0);
     setValidRows([]);
     setFlaggedRows([]);
+    if (inputRef.current) inputRef.current.value = "";
+  };
+
+  const handleDone = async () => {
+    if (finishing) return;
+    setFinishing(true);
+    setError("");
+    try {
+      await finishImportBatch();
+      setBatchFiles([]);
+      setPendingFinish(false);
+      reset();
+    } catch (finishError) {
+      setError(finishError.message);
+    } finally {
+      setFinishing(false);
+    }
   };
 
   return (
@@ -108,6 +172,25 @@ export default function AdminIntake() {
         Upload the month's Excel claims spreadsheet to create new referrals.
       </p>
       {error && <p className="mt-3 text-sm text-rose-600">{error}</p>}
+
+      {batchFiles.length > 0 && (
+        <div className="mt-4 flex items-center justify-between rounded-md border border-slate-200 bg-slate-50 px-4 py-3">
+          <div className="text-sm text-slate-600">
+            <span className="font-medium text-slate-700">
+              {batchFiles.length} file{batchFiles.length === 1 ? "" : "s"}
+            </span>{" "}
+            imported this batch: {batchFiles.join(", ")}
+          </div>
+          <button
+            type="button"
+            onClick={() => setPendingFinish(true)}
+            disabled={finishing || stage === "importing"}
+            className="ml-4 flex-none rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {finishing ? "Finishing..." : "Done with this batch"}
+          </button>
+        </div>
+      )}
 
       {stage === "select" && (
         <div
@@ -242,6 +325,24 @@ export default function AdminIntake() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={Boolean(pendingDuplicateFile)}
+        title="File already imported this batch"
+        description={`"${pendingDuplicateFile?.name ?? ""}" has already been imported as part of this batch. Import it again anyway?`}
+        confirmLabel="Import anyway"
+        onConfirm={confirmDuplicateImport}
+        onCancel={cancelDuplicateImport}
+      />
+
+      <ConfirmDialog
+        open={pendingFinish}
+        title="Finish this batch?"
+        description="This clears the list of files tracked for this batch. Only do this once every referral currently in the system has been signed, assigned, and attached — the next batch won't be checked against these filenames."
+        confirmLabel="Done"
+        onConfirm={handleDone}
+        onCancel={() => setPendingFinish(false)}
+      />
     </div>
   );
 }
