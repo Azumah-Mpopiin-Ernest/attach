@@ -148,6 +148,12 @@ function invalidateDocument(collectionName, documentId) {
  * query would hide real pending referrals rather than just save reads.
  * Fixing that properly needs a schema change (a queryable field set at
  * referral-creation time), not a query-time limit.
+ *
+ * `includeMetadata`: when true, `onData` receives a second argument
+ * `{ fromCache, hasPendingWrites }` and also fires when only that metadata
+ * changes. The officer screen uses this to detect "answering from the local
+ * cache only" (i.e. offline), which `navigator.onLine` can't tell it on a
+ * LAN with no internet. Other screens leave it off and are unaffected.
  */
 export function subscribeToReferrals(
   {
@@ -157,6 +163,7 @@ export function subscribeToReferrals(
     limitCount,
     orderByField,
     orderByDirection = "asc",
+    includeMetadata = false,
   },
   onData,
   onError,
@@ -175,8 +182,21 @@ export function subscribeToReferrals(
 
   return onSnapshot(
     query(collection(db, "referrals"), ...constraints),
-    (snapshot) =>
-      onData(snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))),
+    { includeMetadataChanges: includeMetadata },
+    (snapshot) => {
+      const items = snapshot.docs.map((item) => ({
+        id: item.id,
+        ...item.data(),
+      }));
+      if (includeMetadata) {
+        onData(items, {
+          fromCache: snapshot.metadata.fromCache,
+          hasPendingWrites: snapshot.metadata.hasPendingWrites,
+        });
+      } else {
+        onData(items);
+      }
+    },
     (error) => onError?.(tagQuotaError(error)),
   );
 }
@@ -349,6 +369,14 @@ function dateKeyFor(date) {
  * this can attribute the completion to them. The referral itself is
  * deleted; the counters written here are the only record of the work, and
  * they all belong to the current batch (see resetBatchIfEmpty).
+ *
+ * OFFLINE-FRIENDLY: the commit is started immediately and Firestore's local
+ * cache applies it at once, so live queries (the officer's queue) update
+ * instantly even with no connection. The returned promise settles when the
+ * SERVER confirms or rejects the write, which may be much later. Callers
+ * that don't want to block the UI on that should not await it (see
+ * OfficerApp.markDone). If the server rejects the write, Firestore rolls
+ * the local change back and the referral reappears.
  */
 export async function completeReferral(referralId, officerName) {
   if (!db) throw new Error("Firebase is not configured.");
@@ -382,16 +410,20 @@ export async function completeReferral(referralId, officerName) {
     { merge: true },
   );
 
-  try {
-    await batch.commit();
-  } catch (error) {
-    throw tagQuotaError(error);
-  }
+  // Start the commit now; don't wait for the server before updating caches.
+  const commit = batch.commit();
+
   invalidateCollection("referrals");
   invalidateDocument("metrics", "batchSummary");
   invalidateDocument("metricsDaily", todayKey);
   invalidateDocument("officerDailyStats", officerDailyStatId);
   invalidateDocument("officerStats", officerName);
+
+  try {
+    await commit;
+  } catch (error) {
+    throw tagQuotaError(error);
+  }
 }
 
 /**
@@ -501,9 +533,7 @@ export async function resetBatchIfEmpty() {
   if (!db) throw new Error("Firebase is not configured.");
 
   try {
-    const countSnapshot = await getCountFromServer(
-      collection(db, "referrals"),
-    );
+    const countSnapshot = await getCountFromServer(collection(db, "referrals"));
     if (countSnapshot.data().count > 0) return false;
 
     const snapshots = await Promise.all(

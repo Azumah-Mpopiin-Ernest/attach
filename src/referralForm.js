@@ -11,7 +11,14 @@ const FORM_ASPECT = FORM_WIDTH / FORM_HEIGHT; // ~1.4995
 // THIS IS THE ONLY DEFINITION OF THE REFERRAL FORM DESIGN. Every download in
 // the system (officer single JPEG, admin print-sheet PDFs, admin PNG ZIP)
 // goes through this function, so the form looks identical everywhere.
-export async function renderReferralFormCanvas(referral) {
+//
+// `requireSignatures`: when true, throws if a doctor's signature image is
+// referenced but can't be loaded (e.g. offline and not cached), instead of
+// silently rendering a blank signature line.
+export async function renderReferralFormCanvas(
+  referral,
+  { requireSignatures = false } = {},
+) {
   const canvas = document.createElement("canvas");
   canvas.width = FORM_WIDTH;
   canvas.height = FORM_HEIGHT;
@@ -98,6 +105,7 @@ export async function renderReferralFormCanvas(referral) {
     550,
     300,
     85,
+    requireSignatures,
   );
   await drawSignature(
     context,
@@ -106,6 +114,7 @@ export async function renderReferralFormCanvas(referral) {
     550,
     300,
     85,
+    requireSignatures,
   );
 
   return canvas;
@@ -130,8 +139,12 @@ export async function renderReferralFormPngBytes(referral) {
 }
 
 // --- Single-form download (used by OfficerApp) ---
+// Requires signatures: officers may be offline, and a JPEG with blank
+// signature lines must never be attached to LHIMS by mistake.
 export async function downloadReferralForm(referral) {
-  const canvas = await renderReferralFormCanvas(referral);
+  const canvas = await renderReferralFormCanvas(referral, {
+    requireSignatures: true,
+  });
   const blob = await new Promise((resolve) =>
     canvas.toBlob(resolve, "image/jpeg", 0.92),
   );
@@ -142,7 +155,8 @@ export async function downloadReferralForm(referral) {
   anchor.href = url;
   anchor.download = `${safeFileName(nameOf(referral))}.jpg`;
   anchor.click();
-  URL.revokeObjectURL(url);
+  // Revoking immediately can cancel the download in some browsers.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // --- Bulk print sheets: one A4 PDF per 4 forms, delivered as a zip ---
@@ -173,8 +187,9 @@ export async function downloadReadyToAssignFormsZip(
   for (const referralBatch of referralBatches) {
     // Render only this batch's canvases — everything from prior batches
     // is already gone (turned into PDF bytes) by the time we get here.
+    // (Explicit arrow so .map's index isn't passed as the options argument.)
     const batchCanvases = await Promise.all(
-      referralBatch.map(renderReferralFormCanvas),
+      referralBatch.map((referral) => renderReferralFormCanvas(referral)),
     );
 
     const available = [...leftover, ...batchCanvases];
@@ -216,7 +231,7 @@ export async function downloadReadyToAssignFormsZip(
   anchor.href = url;
   anchor.download = zipFileName ?? defaultZipFileName();
   anchor.click();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 
   return sheetIndex;
 }
@@ -337,10 +352,25 @@ function loadImage(source) {
   return imageCache.get(source);
 }
 
-async function drawSignature(context, source, x, y, width, height) {
+async function drawSignature(
+  context,
+  source,
+  x,
+  y,
+  width,
+  height,
+  required = false,
+) {
   if (!source) return;
   const image = await loadImage(source);
-  if (!image) return;
+  if (!image) {
+    if (required) {
+      throw new Error(
+        "A doctor's signature couldn't be loaded, so the form was not downloaded. Connect to the internet once so signatures are saved on this device, then try again.",
+      );
+    }
+    return;
+  }
 
   const crop = opaqueBounds(image);
   if (!crop) return;

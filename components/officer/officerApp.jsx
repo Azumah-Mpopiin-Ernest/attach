@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { CheckCircle2, Copy, Download, Search } from "lucide-react";
+import {
+  CheckCircle2,
+  Copy,
+  Download,
+  RefreshCw,
+  Search,
+  WifiOff,
+} from "lucide-react";
 import OfficerLayout from "./officerLayout";
 import ConfirmDialog from "../admin/confirmDialog";
 import { completeReferral, subscribeToReferrals } from "../../src/firebaseData";
@@ -13,30 +20,89 @@ import { downloadReferralForm } from "../../src/referralForm";
 
 const PAGE_SIZE = 25;
 
+// Signature URLs already requested this session, so the offline prefetch
+// below doesn't re-fetch every signature after each Mark Done.
+const prefetchedSignatures = new Set();
+
+function useBrowserOnline() {
+  const [online, setOnline] = useState(() => navigator.onLine);
+  useEffect(() => {
+    const goOnline = () => setOnline(true);
+    const goOffline = () => setOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => {
+      window.removeEventListener("online", goOnline);
+      window.removeEventListener("offline", goOffline);
+    };
+  }, []);
+  return online;
+}
+
 export default function OfficerApp({ officerName, onSignOut }) {
   const [referrals, setReferrals] = useState([]);
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
   const [copiedId, setCopiedId] = useState(null);
-  const [savingId, setSavingId] = useState(null);
   const [page, setPage] = useState(1);
   const [selectedDateKey, setSelectedDateKey] = useState(null);
   const [pendingReferral, setPendingReferral] = useState(null);
 
+  // Completions started but not yet confirmed by the server.
+  const [unsynced, setUnsynced] = useState(0);
+  const browserOnline = useBrowserOnline();
+  const [fromCache, setFromCache] = useState(false);
+  const [cacheStale, setCacheStale] = useState(false);
+
   useEffect(
     () =>
       subscribeToReferrals(
-        { assignedTo: officerName },
-        setReferrals,
+        { assignedTo: officerName, includeMetadata: true },
+        (items, meta) => {
+          setReferrals(items);
+          setFromCache(Boolean(meta?.fromCache));
+        },
         (snapshotError) => setError(snapshotError.message),
       ),
     [officerName],
   );
 
+  // navigator.onLine is true on a LAN with no internet, so also treat
+  // "Firestore has only been able to answer from cache for 4s" as offline.
+  useEffect(() => {
+    if (!fromCache) {
+      setCacheStale(false);
+      return undefined;
+    }
+    const timer = setTimeout(() => setCacheStale(true), 4000);
+    return () => clearTimeout(timer);
+  }, [fromCache]);
+
+  const offline = !browserOnline || cacheStale;
+
   const assignedReferrals = useMemo(
     () => referrals.filter((referral) => referral.status === "ASSIGNED"),
     [referrals],
   );
+
+  // While online, touch each doctor signature image once so the service
+  // worker keeps a copy for offline "Download Form".
+  useEffect(() => {
+    if (offline) return;
+    const urls = new Set();
+    assignedReferrals.forEach((referral) => {
+      [referral.referredFromSignatureUrl, referral.referredToSignatureUrl]
+        .filter(Boolean)
+        .forEach((url) => urls.add(url));
+    });
+    urls.forEach((url) => {
+      if (prefetchedSignatures.has(url)) return;
+      prefetchedSignatures.add(url);
+      fetch(url, { mode: "cors" }).catch(() =>
+        prefetchedSignatures.delete(url),
+      );
+    });
+  }, [assignedReferrals, offline]);
 
   // Group the officer's queue by the date on the form (referral.referralDate)
   // so they can pick one admission date, open that date's list in LHIMS,
@@ -98,6 +164,7 @@ export default function OfficerApp({ officerName, onSignOut }) {
   };
 
   const downloadForm = async (referral) => {
+    setError("");
     try {
       await downloadReferralForm(referral);
     } catch (downloadError) {
@@ -105,25 +172,57 @@ export default function OfficerApp({ officerName, onSignOut }) {
     }
   };
 
-  const markDone = async (referral) => {
+  // Deliberately not awaited by the UI: the local cache removes the row at
+  // once (online or offline) and the write syncs in the background. If the
+  // server later rejects it, Firestore rolls it back, the referral
+  // reappears, and we show the error here.
+  const markDone = (referral) => {
     if (!referral) return;
+    const label = referral.name ?? referral.patientName ?? "referral";
     setPendingReferral(null);
-    setSavingId(referral.id);
     setError("");
-    try {
-      await completeReferral(referral.id, officerName);
-      setReferrals((current) =>
-        current.filter((item) => item.id !== referral.id),
-      );
-    } catch (writeError) {
-      setError(writeError.message);
-    } finally {
-      setSavingId(null);
-    }
+    setUnsynced((count) => count + 1);
+    completeReferral(referral.id, officerName)
+      .catch((writeError) =>
+        setError(`Couldn't save ${label}: ${writeError.message}`),
+      )
+      .finally(() => setUnsynced((count) => Math.max(0, count - 1)));
   };
 
   return (
     <OfficerLayout officerName={officerName} onSignOut={onSignOut}>
+      {(offline || unsynced > 0) && (
+        <div
+          className={`mb-4 flex items-start gap-2.5 rounded-md border px-4 py-3 text-sm ${
+            offline
+              ? "border-amber-200 bg-amber-50 text-amber-800"
+              : "border-sky-200 bg-sky-50 text-sky-800"
+          }`}
+        >
+          {offline ? (
+            <WifiOff className="mt-0.5 h-4 w-4 flex-none" />
+          ) : (
+            <RefreshCw className="mt-0.5 h-4 w-4 flex-none animate-spin" />
+          )}
+          <div>
+            {offline ? (
+              <>
+                <span className="font-medium">You're offline.</span> You can
+                keep working — completed referrals are saved on this device and
+                will sync automatically when the connection returns.
+                {unsynced > 0 &&
+                  ` ${unsynced} completion${unsynced === 1 ? "" : "s"} waiting to sync.`}
+              </>
+            ) : (
+              <>
+                Syncing {unsynced} completed referral
+                {unsynced === 1 ? "" : "s"}…
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="text-xl font-semibold text-slate-900">
@@ -226,12 +325,11 @@ export default function OfficerApp({ officerName, onSignOut }) {
                       </button>
                       <button
                         type="button"
-                        disabled={savingId === referral.id}
                         onClick={() => setPendingReferral(referral)}
-                        className="inline-flex items-center gap-1.5 rounded-md bg-[#2F6F62] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#265a50] disabled:opacity-50"
+                        className="inline-flex items-center gap-1.5 rounded-md bg-[#2F6F62] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#265a50]"
                       >
                         <CheckCircle2 className="h-3.5 w-3.5" />
-                        {savingId === referral.id ? "Saving..." : "Mark Done"}
+                        Mark Done
                       </button>
                     </div>
                   </td>

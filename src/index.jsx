@@ -3,6 +3,7 @@ import { HashRouter } from "react-router-dom";
 import App from "./App";
 import "./firebase";
 import "./index.css";
+import { registerServiceWorker } from "./registerServiceWorker";
 
 const root = createRoot(document.getElementById("root"));
 
@@ -11,3 +12,5 @@ root.render(
     <App />
   </HashRouter>,
 );
+
+registerServiceWorker();
