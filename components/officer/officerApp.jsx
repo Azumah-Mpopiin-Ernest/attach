@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { CheckCircle2, Copy, Download, Search } from "lucide-react";
 import OfficerLayout from "./officerLayout";
+import ConfirmDialog from "../admin/confirmDialog";
 import { completeReferral, subscribeToReferrals } from "../../src/firebaseData";
 import {
   getDateKey,
@@ -20,6 +21,7 @@ export default function OfficerApp({ officerName, onSignOut }) {
   const [savingId, setSavingId] = useState(null);
   const [page, setPage] = useState(1);
   const [selectedDateKey, setSelectedDateKey] = useState(null);
+  const [pendingReferral, setPendingReferral] = useState(null);
 
   useEffect(
     () =>
@@ -104,10 +106,12 @@ export default function OfficerApp({ officerName, onSignOut }) {
   };
 
   const markDone = async (referral) => {
+    if (!referral) return;
+    setPendingReferral(null);
     setSavingId(referral.id);
     setError("");
     try {
-      await completeReferral(referral.id);
+      await completeReferral(referral.id, officerName);
       setReferrals((current) =>
         current.filter((item) => item.id !== referral.id),
       );
@@ -223,7 +227,7 @@ export default function OfficerApp({ officerName, onSignOut }) {
                       <button
                         type="button"
                         disabled={savingId === referral.id}
-                        onClick={() => markDone(referral)}
+                        onClick={() => setPendingReferral(referral)}
                         className="inline-flex items-center gap-1.5 rounded-md bg-[#2F6F62] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#265a50] disabled:opacity-50"
                       >
                         <CheckCircle2 className="h-3.5 w-3.5" />
@@ -257,6 +261,15 @@ export default function OfficerApp({ officerName, onSignOut }) {
           />
         </div>
       )}
+
+      <ConfirmDialog
+        open={Boolean(pendingReferral)}
+        title="Mark this referral as done?"
+        description={`Confirm that ${pendingReferral?.name ?? pendingReferral?.patientName ?? "this patient"}'s form has been attached in LHIMS. The referral will be permanently removed from the system and can't be undone.`}
+        confirmLabel="Yes, mark done"
+        onConfirm={() => markDone(pendingReferral)}
+        onCancel={() => setPendingReferral(null)}
+      />
     </OfficerLayout>
   );
 }

@@ -26,17 +26,17 @@ export default function AdminLayout({
   children,
 }) {
   return (
-    <div className="flex min-h-screen flex-col bg-[#F5F6F4] text-slate-900 md:flex-row">
+    <div className="flex min-h-screen flex-col bg-[#F5F6F4] text-slate-900 md:h-screen md:flex-row md:overflow-hidden">
       {/* Sidebar */}
-      <aside className="flex w-full flex-none flex-col bg-[#16232A] text-slate-200 md:w-60">
-        <div className="flex items-center justify-between px-4 py-4 md:block md:px-5 md:py-5">
+      <aside className="flex w-full flex-none flex-col bg-[#16232A] text-slate-200 md:h-screen md:w-60">
+        <div className="flex flex-none items-center justify-between px-4 py-4 md:block md:px-5 md:py-5">
           <span className="text-sm font-semibold tracking-tight text-white">
             Referral Bridge
           </span>
           <span className="block text-xs text-slate-400">Admin</span>
         </div>
 
-        <nav className="mt-0 flex flex-1 gap-1 overflow-x-auto px-3 pb-2 md:mt-2 md:block md:space-y-0.5 md:overflow-visible md:pb-0">
+        <nav className="mt-0 flex flex-1 gap-1 overflow-x-auto px-3 pb-2 md:mt-2 md:block md:min-h-0 md:space-y-0.5 md:overflow-y-auto md:overflow-x-hidden md:pb-0">
           {NAV_ITEMS.map(({ key, label, icon: Icon }) => {
             const isActive = activePage === key;
             return (
@@ -58,7 +58,7 @@ export default function AdminLayout({
           })}
         </nav>
 
-        <div className="border-t border-white/10 px-3 py-3 md:py-4">
+        <div className="flex-none border-t border-white/10 px-3 py-3 md:py-4">
           <button
             type="button"
             onClick={onSignOut}
@@ -71,7 +71,7 @@ export default function AdminLayout({
       </aside>
 
       {/* Main column */}
-      <div className="flex min-h-screen flex-1 flex-col">
+      <div className="flex min-h-screen flex-1 flex-col md:h-screen md:min-h-0 md:min-w-0">
         <header className="flex min-h-14 flex-none items-center justify-end border-b border-slate-200 bg-white px-4 py-3 md:px-6 md:py-0">
           <div className="flex min-w-0 items-center gap-2 text-sm text-slate-600">
             <span className="rounded-full bg-[#2F6F62]/10 px-2 py-0.5 text-xs font-medium text-[#2F6F62]">
@@ -81,7 +81,7 @@ export default function AdminLayout({
           </div>
         </header>
 
-        <main className="min-w-0 flex-1 overflow-y-auto px-4 py-5 md:px-8 md:py-7">
+        <main className="min-h-0 min-w-0 flex-1 overflow-y-auto px-4 py-5 md:px-8 md:py-7">
           {children}
         </main>
       </div>

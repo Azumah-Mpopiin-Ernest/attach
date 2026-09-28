@@ -309,11 +309,33 @@ export async function updateReferralsTransaction(
   return { applied, skipped };
 }
 
+// ---------------------------------------------------------------------------
+// BATCH-SCOPED DATA
+//
+// Everything below the referrals themselves belongs to the batch currently
+// being worked on, and is wiped by resetBatchIfEmpty() the moment the
+// referrals collection is empty (i.e. every referral has been signed,
+// assigned, attached in LHIMS and marked done):
+//
+//   meta/currentImportBatch   filenames imported + total rows imported
+//   metrics/batchSummary      referrals completed
+//   metricsDaily/{dateKey}    completions per calendar day (7-day chart)
+//   officerDailyStats/{...}   completions per officer per day
+//   officerStats/{name}       completions per officer (batch total)
+// ---------------------------------------------------------------------------
+
+const BATCH_COLLECTIONS = [
+  "meta",
+  "metrics",
+  "metricsDaily",
+  "officerStats",
+  "officerDailyStats",
+];
+
 // metricsDaily/{dateKey} holds one counter per calendar day (client-local
 // date, e.g. "2026-09-27"). completeReferral() deletes the referral
 // document itself, so this is the only surviving record of *when*
-// completions happened — needed for "completed today" and any day-by-day
-// dashboard view.
+// completions happened within the current batch.
 function dateKeyFor(date) {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -321,14 +343,26 @@ function dateKeyFor(date) {
   return `${year}-${month}-${day}`;
 }
 
-export async function completeReferral(referralId) {
+/**
+ * Marks one referral complete. Requires `officerName` (the officer's
+ * profile fullName, matching how `assignedTo` is stored on referrals) so
+ * this can attribute the completion to them. The referral itself is
+ * deleted; the counters written here are the only record of the work, and
+ * they all belong to the current batch (see resetBatchIfEmpty).
+ */
+export async function completeReferral(referralId, officerName) {
   if (!db) throw new Error("Firebase is not configured.");
+  if (!officerName) {
+    throw new Error("An officer name is required to complete a referral.");
+  }
 
   const todayKey = dateKeyFor(new Date());
+  const officerDailyStatId = `${officerName}_${todayKey}`;
+
   const batch = writeBatch(db);
   batch.delete(doc(db, "referrals", referralId));
   batch.set(
-    doc(db, "metrics", "summary"),
+    doc(db, "metrics", "batchSummary"),
     { completedCount: increment(1) },
     { merge: true },
   );
@@ -337,14 +371,27 @@ export async function completeReferral(referralId) {
     { count: increment(1) },
     { merge: true },
   );
+  batch.set(
+    doc(db, "officerDailyStats", officerDailyStatId),
+    { officerName, dateKey: todayKey, count: increment(1) },
+    { merge: true },
+  );
+  batch.set(
+    doc(db, "officerStats", officerName),
+    { officerName, totalCompleted: increment(1) },
+    { merge: true },
+  );
+
   try {
     await batch.commit();
   } catch (error) {
     throw tagQuotaError(error);
   }
   invalidateCollection("referrals");
-  invalidateDocument("metrics", "summary");
+  invalidateDocument("metrics", "batchSummary");
   invalidateDocument("metricsDaily", todayKey);
+  invalidateDocument("officerDailyStats", officerDailyStatId);
+  invalidateDocument("officerStats", officerName);
 }
 
 /**
@@ -352,7 +399,7 @@ export async function completeReferral(referralId) {
  * today), oldest first: [{ dateKey, date, count }]. Reads one doc per day
  * (cheap, and cached like everything else in this file) rather than a
  * range query, since metricsDaily docs are keyed by date string, not a
- * queryable timestamp field.
+ * queryable timestamp field. Only reflects the current batch.
  */
 export async function getDailyCompletionCounts(days = 7) {
   const today = new Date();
@@ -373,62 +420,112 @@ export async function getDailyCompletionCounts(days = 7) {
   }));
 }
 
-// meta/currentImportBatch tracks which Excel filenames have already been
-// imported for the CURRENT intake batch only. Admin never starts a new
-// batch until every referral from the current one has been signed,
-// assigned, attached, and cleared from the system — so this deliberately
-// does NOT need to remember filenames across batches. finishImportBatch()
-// (called by the admin's "Done" action) deletes this doc entirely once
-// the batch is finished, so it never grows unbounded and never flags a
-// filename from a previous, already-completed batch.
-const IMPORT_BATCH_COLLECTION = "meta";
-const IMPORT_BATCH_DOC_ID = "currentImportBatch";
-
 /**
- * Filenames already imported in the batch currently in progress (empty
- * array if no batch is in progress, i.e. after "Done" was last clicked).
+ * Per-officer completion counts for the CURRENT batch: today, the last
+ * `days` days (default 7), and batch total — sorted by total, descending.
+ * Everything here is wiped when the batch closes.
+ *
+ * "Today"/"week" come from officerDailyStats (one doc per officer per
+ * calendar day), queried directly rather than through the generic cache
+ * helper since a `where(...,"in",...)` constraint doesn't hash reliably
+ * as a cache key. "Total" comes from officerStats.
  */
-export async function getImportBatchFileNames(options) {
-  const data = await getDocument(
-    IMPORT_BATCH_COLLECTION,
-    IMPORT_BATCH_DOC_ID,
-    options,
+export async function getOfficerPerformance(days = 7) {
+  if (!db) throw new Error("Firebase is not configured.");
+
+  const today = new Date();
+  const dateKeys = Array.from({ length: days }, (_, index) => {
+    const date = new Date(today);
+    date.setDate(date.getDate() - (days - 1 - index));
+    return dateKeyFor(date);
+  });
+  const todayKey = dateKeys[dateKeys.length - 1];
+
+  const [dailySnapshot, officerTotals] = await Promise.all([
+    getDocs(
+      query(
+        collection(db, "officerDailyStats"),
+        where("dateKey", "in", dateKeys),
+      ),
+    ).catch((error) => {
+      throw tagQuotaError(error);
+    }),
+    getCollection("officerStats"),
+  ]);
+
+  const byOfficer = new Map();
+  const ensure = (officerName) => {
+    if (!byOfficer.has(officerName)) {
+      byOfficer.set(officerName, {
+        officerName,
+        today: 0,
+        week: 0,
+        total: 0,
+      });
+    }
+    return byOfficer.get(officerName);
+  };
+
+  dailySnapshot.docs.forEach((snapshot) => {
+    const { officerName, dateKey, count } = snapshot.data();
+    const entry = ensure(officerName);
+    entry.week += count;
+    if (dateKey === todayKey) entry.today += count;
+  });
+
+  officerTotals.forEach(({ officerName, totalCompleted }) => {
+    ensure(officerName).total = totalCompleted ?? 0;
+  });
+
+  return Array.from(byOfficer.values()).sort(
+    (a, b) => b.total - a.total || a.officerName.localeCompare(b.officerName),
   );
-  return data?.fileNames ?? [];
 }
 
 /**
- * Records that `fileName` was successfully imported as part of the batch
- * in progress. Creates the tracking doc on the first file of a batch.
+ * THE BATCH RESET. If the referrals collection is empty, the current batch
+ * is finished: delete every batch-scoped document (imported count, filename
+ * list, completed counts, daily counts, officer stats) so the next batch
+ * starts from zero.
+ *
+ * Call this on admin page load (dashboard, intake) and right before an
+ * import. Cost when referrals still exist: a single aggregation-count read.
+ * Admin-only (the security rules only let admin delete these docs).
+ *
+ * This also covers deleteAllReferrals(): once that empties the collection,
+ * the next call here performs the reset.
+ *
+ * Resolves to true if it wiped anything, false otherwise.
  */
-export async function markFileImported(fileName) {
+export async function resetBatchIfEmpty() {
   if (!db) throw new Error("Firebase is not configured.");
+
   try {
-    await setDoc(
-      doc(db, IMPORT_BATCH_COLLECTION, IMPORT_BATCH_DOC_ID),
-      { fileNames: arrayUnion(fileName) },
-      { merge: true },
+    const countSnapshot = await getCountFromServer(
+      collection(db, "referrals"),
     );
-  } catch (error) {
-    throw tagQuotaError(error);
-  } finally {
-    invalidateDocument(IMPORT_BATCH_COLLECTION, IMPORT_BATCH_DOC_ID);
-  }
-}
+    if (countSnapshot.data().count > 0) return false;
 
-/**
- * Called when admin clicks "Done" after finishing a batch: deletes the
- * tracking doc so the next batch starts with a clean slate. Safe to call
- * even if no tracking doc exists yet.
- */
-export async function finishImportBatch() {
-  if (!db) throw new Error("Firebase is not configured.");
-  try {
-    await deleteDoc(doc(db, IMPORT_BATCH_COLLECTION, IMPORT_BATCH_DOC_ID));
+    const snapshots = await Promise.all(
+      BATCH_COLLECTIONS.map((name) => getDocs(collection(db, name))),
+    );
+    const refs = snapshots.flatMap((snapshot) =>
+      snapshot.docs.map((item) => item.ref),
+    );
+    if (!refs.length) return false;
+
+    for (let start = 0; start < refs.length; start += 450) {
+      const batch = writeBatch(db);
+      refs.slice(start, start + 450).forEach((ref) => batch.delete(ref));
+      await batch.commit();
+    }
+    return true;
   } catch (error) {
     throw tagQuotaError(error);
   } finally {
-    invalidateDocument(IMPORT_BATCH_COLLECTION, IMPORT_BATCH_DOC_ID);
+    // Whatever happened, cached batch numbers may now be stale.
+    collectionCache.clear();
+    documentCache.clear();
   }
 }
 
@@ -445,7 +542,9 @@ export async function finishImportBatch() {
  * failure) and `quotaExceeded` if that was the cause.
  *
  * Only removes Firestore documents; it does not touch files in Firebase
- * Storage, and it does not change the `metrics/summary` counters.
+ * Storage. Batch metrics are NOT cleared here directly — but since the
+ * collection is now empty, the next admin page load runs
+ * resetBatchIfEmpty() and clears them.
  */
 export async function deleteAllReferrals({ onProgress, confirm } = {}) {
   if (!db) throw new Error("Firebase is not configured.");
@@ -578,5 +677,92 @@ export async function createDocuments(collectionName, documents) {
     throw tagQuotaError(error);
   } finally {
     invalidateCollection(collectionName);
+  }
+}
+
+// meta/currentImportBatch tracks, for the CURRENT batch:
+//   fileNames     — filenames imported since admin last clicked "Done" on the
+//                   intake page (powers the duplicate-file warning only)
+//   importedCount — total referral rows imported so far in the batch
+//
+// Clicking "Done" on the intake page only clears `fileNames`. The whole doc
+// (including importedCount) is deleted by resetBatchIfEmpty() once every
+// referral in the batch has been completed.
+const IMPORT_BATCH_COLLECTION = "meta";
+const IMPORT_BATCH_DOC_ID = "currentImportBatch";
+
+/**
+ * Filenames imported since "Done" was last clicked (empty array if none).
+ */
+export async function getImportBatchFileNames(options) {
+  const data = await getDocument(
+    IMPORT_BATCH_COLLECTION,
+    IMPORT_BATCH_DOC_ID,
+    options,
+  );
+  return data?.fileNames ?? [];
+}
+
+/**
+ * Total referral rows imported so far in the current batch.
+ */
+export async function getImportBatchImportedCount(options) {
+  const data = await getDocument(
+    IMPORT_BATCH_COLLECTION,
+    IMPORT_BATCH_DOC_ID,
+    options,
+  );
+  return data?.importedCount ?? 0;
+}
+
+/**
+ * Referrals completed so far in the current batch.
+ */
+export async function getBatchCompletedCount(options) {
+  const data = await getDocument("metrics", "batchSummary", options);
+  return data?.completedCount ?? 0;
+}
+
+/**
+ * Records that `fileName` (containing `importedRowCount` referral rows)
+ * was successfully imported as part of the batch in progress. Creates the
+ * tracking doc on the first file of a batch.
+ */
+export async function markFileImported(fileName, importedRowCount = 0) {
+  if (!db) throw new Error("Firebase is not configured.");
+  try {
+    await setDoc(
+      doc(db, IMPORT_BATCH_COLLECTION, IMPORT_BATCH_DOC_ID),
+      {
+        fileNames: arrayUnion(fileName),
+        importedCount: increment(importedRowCount),
+      },
+      { merge: true },
+    );
+  } catch (error) {
+    throw tagQuotaError(error);
+  } finally {
+    invalidateDocument(IMPORT_BATCH_COLLECTION, IMPORT_BATCH_DOC_ID);
+  }
+}
+
+/**
+ * Called when admin clicks "Done" on the intake page — meaning "I'm finished
+ * uploading files for now", NOT "the batch is finished". Only clears the
+ * filename list used for the duplicate-upload warning. importedCount and all
+ * other batch metrics keep running until referrals hit 0.
+ */
+export async function clearImportBatchFileNames() {
+  if (!db) throw new Error("Firebase is not configured.");
+  try {
+    await setDoc(
+      doc(db, IMPORT_BATCH_COLLECTION, IMPORT_BATCH_DOC_ID),
+      { fileNames: [] },
+      { merge: true },
+    );
+  } catch (error) {
+    throw tagQuotaError(error);
+  } finally {
+    invalidateDocument(IMPORT_BATCH_COLLECTION, IMPORT_BATCH_DOC_ID);
   }
 }

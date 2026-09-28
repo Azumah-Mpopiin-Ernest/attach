@@ -8,19 +8,21 @@ import {
 import * as XLSX from "xlsx";
 import ConfirmDialog from "./confirmDialog";
 import {
+  clearImportBatchFileNames,
   createDocuments,
-  finishImportBatch,
   getImportBatchFileNames,
   markFileImported,
+  resetBatchIfEmpty,
 } from "../../src/firebaseData";
 
 // Stages: "select" -> "review" -> "importing" -> "done"
 //
-// batchFiles tracks every filename successfully imported since the last
-// time "Done" was clicked (persisted in meta/currentImportBatch so it
-// survives a page refresh mid-batch). It's what powers the duplicate-file
-// warning and the "Done" button below — see firebaseData.js for why this
-// is scoped to the current batch only, not tracked forever.
+// batchFiles tracks every filename imported since the last time "Done" was
+// clicked (persisted in meta/currentImportBatch so it survives a page
+// refresh). It only powers the duplicate-file warning. "Done" here means
+// "finished uploading files", NOT "batch finished" — the batch (and all its
+// metrics) is reset automatically once every referral has been completed
+// (see resetBatchIfEmpty in firebaseData.js).
 
 export default function AdminIntake() {
   const [stage, setStage] = useState("select");
@@ -38,7 +40,10 @@ export default function AdminIntake() {
   const [pendingFinish, setPendingFinish] = useState(false);
 
   useEffect(() => {
-    getImportBatchFileNames()
+    // If the previous batch is fully complete (no referrals left), wipe its
+    // leftovers first so stale filenames don't trigger duplicate warnings.
+    resetBatchIfEmpty()
+      .then(() => getImportBatchFileNames({ force: true }))
       .then(setBatchFiles)
       .catch((loadError) => setError(loadError.message));
   }, []);
@@ -110,34 +115,39 @@ export default function AdminIntake() {
     [handleFile],
   );
 
-  const startImport = useCallback(() => {
+  const startImport = useCallback(async () => {
     setStage("importing");
     setProgress(0);
-    createDocuments(
-      "referrals",
-      validRows.map((row) => ({
-        patientId: row.patientid,
-        name: row.name,
-        nhis: row.nhis,
-        nhiaNo: row.nhiaNo,
-        referralDate: row.referralDate,
-        reason: row.reason,
-        status: "AWAITING_SIGN",
-        createdAt: new Date(),
-      })),
-    )
-      .then(() => markFileImported(fileName))
-      .then(() => {
-        setBatchFiles((current) =>
-          current.includes(fileName) ? current : [...current, fileName],
-        );
-        setProgress(validRows.length);
-        setStage("done");
-      })
-      .catch((writeError) => {
-        setError(writeError.message);
-        setStage("review");
-      });
+    setError("");
+    try {
+      // Guard against the admin sitting on this page while the previous
+      // batch finished: if no referrals remain, start this import on a
+      // clean slate rather than on top of the old batch's numbers.
+      if (await resetBatchIfEmpty()) setBatchFiles([]);
+
+      await createDocuments(
+        "referrals",
+        validRows.map((row) => ({
+          patientId: row.patientid,
+          name: row.name,
+          nhis: row.nhis,
+          nhiaNo: row.nhiaNo,
+          referralDate: row.referralDate,
+          reason: row.reason,
+          status: "AWAITING_SIGN",
+          createdAt: new Date(),
+        })),
+      );
+      await markFileImported(fileName, validRows.length);
+      setBatchFiles((current) =>
+        current.includes(fileName) ? current : [...current, fileName],
+      );
+      setProgress(validRows.length);
+      setStage("done");
+    } catch (writeError) {
+      setError(writeError.message);
+      setStage("review");
+    }
   }, [validRows, fileName]);
 
   const reset = () => {
@@ -149,12 +159,14 @@ export default function AdminIntake() {
     if (inputRef.current) inputRef.current.value = "";
   };
 
+  // "Done" = finished uploading files. Only clears the duplicate-warning
+  // filename list; batch metrics are untouched.
   const handleDone = async () => {
     if (finishing) return;
     setFinishing(true);
     setError("");
     try {
-      await finishImportBatch();
+      await clearImportBatchFileNames();
       setBatchFiles([]);
       setPendingFinish(false);
       reset();
@@ -179,7 +191,7 @@ export default function AdminIntake() {
             <span className="font-medium text-slate-700">
               {batchFiles.length} file{batchFiles.length === 1 ? "" : "s"}
             </span>{" "}
-            imported this batch: {batchFiles.join(", ")}
+            uploaded: {batchFiles.join(", ")}
           </div>
           <button
             type="button"
@@ -187,7 +199,7 @@ export default function AdminIntake() {
             disabled={finishing || stage === "importing"}
             className="ml-4 flex-none rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {finishing ? "Finishing..." : "Done with this batch"}
+            {finishing ? "Finishing..." : "Done uploading"}
           </button>
         </div>
       )}
@@ -328,8 +340,8 @@ export default function AdminIntake() {
 
       <ConfirmDialog
         open={Boolean(pendingDuplicateFile)}
-        title="File already imported this batch"
-        description={`"${pendingDuplicateFile?.name ?? ""}" has already been imported as part of this batch. Import it again anyway?`}
+        title="File already uploaded"
+        description={`"${pendingDuplicateFile?.name ?? ""}" has already been uploaded in this batch. Import it again anyway?`}
         confirmLabel="Import anyway"
         onConfirm={confirmDuplicateImport}
         onCancel={cancelDuplicateImport}
@@ -337,8 +349,8 @@ export default function AdminIntake() {
 
       <ConfirmDialog
         open={pendingFinish}
-        title="Finish this batch?"
-        description="This clears the list of files tracked for this batch. Only do this once every referral currently in the system has been signed, assigned, and attached — the next batch won't be checked against these filenames."
+        title="Done uploading files?"
+        description="This only clears the list of uploaded filenames used for the duplicate-file warning. The dashboard numbers are not affected — they reset automatically once every referral has been completed."
         confirmLabel="Done"
         onConfirm={handleDone}
         onCancel={() => setPendingFinish(false)}
