@@ -3,7 +3,11 @@ import { Copy, Check } from "lucide-react";
 import { doc, getDoc, setDoc } from "firebase/firestore";
 import ConfirmDialog from "./confirmDialog";
 import { db } from "../../src/firebase";
-import { getCollection, updateDocument } from "../../src/firebaseData";
+import {
+  deleteDocument,
+  getCollection,
+  updateDocument,
+} from "../../src/firebaseData";
 import Pagination from "../shared/Pagination";
 
 const PAGE_SIZE = 25;
@@ -30,6 +34,7 @@ export default function AdminKeys() {
   const [role, setRole] = useState("doctor");
   const [copiedId, setCopiedId] = useState(null);
   const [pendingRevoke, setPendingRevoke] = useState(null);
+  const [pendingDelete, setPendingDelete] = useState(null);
   const [error, setError] = useState("");
   const [generating, setGenerating] = useState(false);
   const [page, setPage] = useState(1);
@@ -117,6 +122,20 @@ export default function AdminKeys() {
       .catch((writeError) => setError(writeError.message));
   };
 
+  const applyDelete = () => {
+    if (!pendingDelete) return;
+    deleteDocument("registrationKeys", pendingDelete.id)
+      .then(async () => {
+        setKeys(
+          (await getCollection("registrationKeys", { force: true })).sort(
+            compareCreatedAtDescending,
+          ),
+        );
+        setPendingDelete(null);
+      })
+      .catch((writeError) => setError(writeError.message));
+  };
+
   return (
     <div>
       <h1 className="text-xl font-semibold text-slate-900">
@@ -161,53 +180,66 @@ export default function AdminKeys() {
             </tr>
           </thead>
           <tbody>
-            {paginatedKeys.map((key) => (
-              <tr
-                key={key.id}
-                className="border-b border-slate-100 last:border-0"
-              >
-                <td className="px-5 py-3 font-mono text-slate-800">
-                  {key.code}
-                </td>
-                <td className="px-5 py-3 text-slate-600">{key.role}</td>
-                <td
-                  className={`px-5 py-3 ${STATUS_LABEL[getKeyStatus(key)].cls}`}
+            {paginatedKeys.map((key) => {
+              const status = getKeyStatus(key);
+              return (
+                <tr
+                  key={key.id}
+                  className="border-b border-slate-100 last:border-0"
                 >
-                  {STATUS_LABEL[getKeyStatus(key)].text}
-                  {getKeyStatus(key) === "used" && key.usedByName && (
-                    <span className="text-slate-400"> — {key.usedByName}</span>
-                  )}
-                </td>
-                <td className="px-5 py-3 text-right">
-                  {getKeyStatus(key) === "unused" && (
+                  <td className="px-5 py-3 font-mono text-slate-800">
+                    {key.code}
+                  </td>
+                  <td className="px-5 py-3 text-slate-600">{key.role}</td>
+                  <td className={`px-5 py-3 ${STATUS_LABEL[status].cls}`}>
+                    {STATUS_LABEL[status].text}
+                    {status === "used" && key.usedByName && (
+                      <span className="text-slate-400">
+                        {" "}
+                        — {key.usedByName}
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-5 py-3 text-right">
                     <div className="flex justify-end gap-2">
+                      {status === "unused" && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => handleCopy(key)}
+                            className="inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100"
+                          >
+                            {copiedId === key.id ? (
+                              <>
+                                <Check className="h-3.5 w-3.5" /> Copied
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="h-3.5 w-3.5" /> Copy
+                              </>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setPendingRevoke(key)}
+                            className="rounded-md px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-50"
+                          >
+                            Revoke
+                          </button>
+                        </>
+                      )}
                       <button
                         type="button"
-                        onClick={() => handleCopy(key)}
-                        className="inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100"
-                      >
-                        {copiedId === key.id ? (
-                          <>
-                            <Check className="h-3.5 w-3.5" /> Copied
-                          </>
-                        ) : (
-                          <>
-                            <Copy className="h-3.5 w-3.5" /> Copy
-                          </>
-                        )}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setPendingRevoke(key)}
+                        onClick={() => setPendingDelete(key)}
                         className="rounded-md px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-50"
                       >
-                        Revoke
+                        Delete
                       </button>
                     </div>
-                  )}
-                </td>
-              </tr>
-            ))}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
         <Pagination
@@ -226,6 +258,20 @@ export default function AdminKeys() {
         tone="danger"
         onConfirm={applyRevoke}
         onCancel={() => setPendingRevoke(null)}
+      />
+
+      <ConfirmDialog
+        open={Boolean(pendingDelete)}
+        title={`Delete key ${pendingDelete?.code}?`}
+        description={
+          pendingDelete && getKeyStatus(pendingDelete) === "used"
+            ? "This key has already been used to create an account — deleting it only removes the key record, it won't affect that account."
+            : "This permanently removes the key. Anyone who still has this code won't be able to use it to create an account."
+        }
+        confirmLabel="Delete"
+        tone="danger"
+        onConfirm={applyDelete}
+        onCancel={() => setPendingDelete(null)}
       />
     </div>
   );
