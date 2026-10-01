@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, CheckCircle2, Copy, Download, SkipForward } from "lucide-react";
 import { formatDateLabel, getDateKey } from "../../src/referralDates";
+import { renderReferralFormJpegBlob } from "../../src/referralForm";
 import { referralName, useReferralActions } from "./referralFlow";
 
 const BUTTON_BASE =
@@ -12,7 +13,7 @@ const SIZE_CLASSES = {
 const ICON_CLASSES = { sm: "h-3.5 w-3.5", lg: "h-4 w-4" };
 const LOCKED_CLASSES = "border-transparent bg-slate-200 text-slate-400";
 const LOCKED_TITLE =
-  "Copy the ID, download the form and try the upload in LHIMS first";
+  "Copy the ID, download or drag the form, and try the upload in LHIMS first";
 
 function withCountdown(label, secondsLeft) {
   return secondsLeft > 0 ? `${label} (${secondsLeft}s)` : label;
@@ -95,15 +96,103 @@ function SkipButton({ unlocked, secondsLeft, onClick }) {
   );
 }
 
-function DownloadedBadge() {
+function FormStatusBadge({ actions }) {
+  let label = null;
+  if (actions.fileDownloaded) label = "Downloaded";
+  else if (actions.fileDragged) label = "Form dragged";
+  if (!label) return null;
+
   return (
     <span
       role="status"
       className="inline-flex items-center gap-1 rounded-full bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white"
     >
       <CheckCircle2 className="h-3.5 w-3.5" />
-      Downloaded
+      {label}
     </span>
+  );
+}
+
+// A preview of the exact JPEG that Download Form saves, which the officer
+// can drag straight into LHIMS's attachment drop area. The picture IS the
+// form for the patient on screen, so there is no file picker or Downloads
+// folder to get the wrong file from.
+//
+// It is rendered once per referral (keyed by id, with the latest referral
+// read from a ref) so a Firestore snapshot arriving mid-drag can't replace
+// or revoke the image being dragged. Signatures are required, exactly as for
+// the download: a form with blank signature lines must never be attachable.
+function FormPreview({ referral, onDragged }) {
+  const referralRef = useRef(referral);
+  const [preview, setPreview] = useState({ url: null, error: "" });
+
+  useEffect(() => {
+    referralRef.current = referral;
+  });
+
+  useEffect(() => {
+    let active = true;
+    let objectUrl = null;
+    renderReferralFormJpegBlob(referralRef.current)
+      .then((blob) => {
+        if (!active) return;
+        objectUrl = URL.createObjectURL(blob);
+        setPreview({ url: objectUrl, error: "" });
+      })
+      .catch((previewError) => {
+        if (active) setPreview({ url: null, error: previewError.message });
+      });
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [referral.id]);
+
+  let content;
+  if (preview.url) {
+    content = (
+      <img
+        src={preview.url}
+        alt={`Referral form for ${referralName(referral)}`}
+        draggable
+        onDragStart={(event) => {
+          event.dataTransfer.effectAllowed = "copy";
+        }}
+        onDragEnd={(event) => {
+          // "none" means nothing accepted the drop (cancelled, or dropped
+          // somewhere that doesn't take files).
+          if (event.dataTransfer.dropEffect !== "none") onDragged();
+        }}
+        className="max-h-64 w-auto max-w-full cursor-grab rounded border border-slate-200 shadow-sm active:cursor-grabbing"
+      />
+    );
+  } else if (preview.error) {
+    content = (
+      <p role="alert" className="text-sm text-rose-600">
+        Couldn't prepare the form preview: {preview.error}
+      </p>
+    );
+  } else {
+    content = (
+      <div
+        role="status"
+        aria-label="Preparing form preview"
+        className="h-40 w-64 animate-pulse rounded bg-slate-100"
+      />
+    );
+  }
+
+  return (
+    <div className="mt-4 rounded-md border border-dashed border-slate-300 px-4 py-3">
+      <p className="text-sm font-medium text-slate-700">
+        Or drag this form into LHIMS
+      </p>
+      <p className="mt-0.5 text-sm text-slate-500">
+        Drop it on the attachment area in LHIMS. It is the same file Download
+        Form saves.
+      </p>
+      <div className="mt-3">{content}</div>
+    </div>
   );
 }
 
@@ -168,7 +257,9 @@ function unlockHint({ actions, ready, secondsLeft }) {
   if (!ready) {
     const steps = [];
     if (!actions.idCopied) steps.push("copy the ID");
-    if (!actions.fileDownloaded) steps.push("download the form");
+    if (!actions.fileDownloaded && !actions.fileDragged) {
+      steps.push("download or drag the form");
+    }
     return `Still to do before Mark Done or Skip: ${steps.join(" and ")}.`;
   }
   if (secondsLeft > 0) {
@@ -188,8 +279,15 @@ export function ActiveReferralCard({
   onError,
 }) {
   const flow = useReferralActions(referral, onError);
-  const { actions, downloading, unlocked, secondsLeft, copyId, download } =
-    flow;
+  const {
+    actions,
+    downloading,
+    unlocked,
+    secondsLeft,
+    copyId,
+    download,
+    markDragged,
+  } = flow;
 
   return (
     <article
@@ -203,7 +301,7 @@ export function ActiveReferralCard({
             {formatDateLabel(getDateKey(referral))}
           </span>
         </p>
-        {actions.fileDownloaded && <DownloadedBadge />}
+        <FormStatusBadge actions={actions} />
       </header>
 
       <div className="px-6 py-6">
@@ -237,6 +335,8 @@ export function ActiveReferralCard({
             onClick={download}
           />
         </div>
+
+        <FormPreview referral={referral} onDragged={markDragged} />
 
         <div className="mt-6 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-5">
           <SkipButton
@@ -274,7 +374,7 @@ export function SkippedReferralRow({ referral, onRequestDone, onError }) {
           <span className="break-words font-medium text-slate-800">
             {referralName(referral, "Unnamed patient")}
           </span>
-          {actions.fileDownloaded && <DownloadedBadge />}
+          <FormStatusBadge actions={actions} />
         </div>
         <p className="mt-0.5 break-all font-mono text-xs text-slate-500">
           ID {referral.patientId ?? "—"}, NHIS {referral.nhis ?? "—"}, dated{" "}

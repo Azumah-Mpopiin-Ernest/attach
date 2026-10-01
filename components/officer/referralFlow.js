@@ -8,7 +8,12 @@ const DONE_COUNT_KEY_PREFIX = "officer-flow:done:";
 // locked for this long: time to actually attempt the upload in LHIMS.
 const UNLOCK_SECONDS = 10;
 
-const NO_ACTIONS = { idCopied: false, fileDownloaded: false, readyAt: null };
+const NO_ACTIONS = {
+  idCopied: false,
+  fileDownloaded: false,
+  fileDragged: false,
+  readyAt: null,
+};
 
 // sessionStorage can throw (storage disabled, private mode, quota). The
 // workflow must keep working without persistence, so every access is guarded.
@@ -36,12 +41,18 @@ function removeSession(key) {
   }
 }
 
+// The form counts as handed over once it was downloaded OR dragged into
+// LHIMS (the drop was accepted by the target).
+function formHandedOver(actions) {
+  return actions.fileDownloaded || actions.fileDragged;
+}
+
 // Applies `patch` and stamps `readyAt` (when the countdown started) the
 // moment both prerequisites are first satisfied. `now` is passed in so this
 // stays a pure function.
 function withAction(current, patch, now) {
   const next = { ...current, ...patch };
-  if (next.idCopied && next.fileDownloaded && next.readyAt === null) {
+  if (next.idCopied && formHandedOver(next) && next.readyAt === null) {
     next.readyAt = now;
   }
   return next;
@@ -56,6 +67,7 @@ function readActions(referralId) {
       {
         idCopied: saved?.idCopied === true,
         fileDownloaded: saved?.fileDownloaded === true,
+        fileDragged: saved?.fileDragged === true,
         readyAt: typeof saved?.readyAt === "number" ? saved.readyAt : null,
       },
       {},
@@ -108,7 +120,7 @@ export function referralName(referral, fallback = "this patient") {
 /**
  * Tracks the safeguards for ONE referral:
  *   1. the LHIMS ID has been copied,
- *   2. the form has been downloaded,
+ *   2. the form has been downloaded or dragged into LHIMS,
  *   3. a 10 second countdown, started once 1 and 2 are both true, has run
  *      out (`unlocked`). Mark Done and Skip both wait for this.
  *
@@ -126,12 +138,12 @@ export function useReferralActions(referral, reportError) {
   const [downloading, setDownloading] = useState(false);
 
   useEffect(() => {
-    if (actions.idCopied || actions.fileDownloaded) {
+    if (actions.idCopied || formHandedOver(actions)) {
       writeSession(ACTIONS_KEY_PREFIX + id, JSON.stringify(actions));
     }
   }, [id, actions]);
 
-  const ready = actions.idCopied && actions.fileDownloaded;
+  const ready = actions.idCopied && formHandedOver(actions);
   const secondsLeft = useUnlockCountdown(ready ? actions.readyAt : null);
 
   const copyId = async () => {
@@ -169,6 +181,13 @@ export function useReferralActions(referral, reportError) {
     }
   };
 
+  // Called when the browser reports that the dragged form preview was
+  // accepted by a drop target (see FormPreview).
+  const markDragged = () => {
+    const now = Date.now();
+    setActions((current) => withAction(current, { fileDragged: true }, now));
+  };
+
   return {
     actions,
     downloading,
@@ -177,6 +196,7 @@ export function useReferralActions(referral, reportError) {
     unlocked: ready && secondsLeft === 0,
     copyId,
     download,
+    markDragged,
   };
 }
 

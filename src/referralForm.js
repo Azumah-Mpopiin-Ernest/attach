@@ -138,18 +138,28 @@ export async function renderReferralFormPngBytes(referral) {
   }
 }
 
-// --- Single-form download (used by OfficerApp) ---
+// --- Officer form as a JPEG blob (used by the download and the drag preview) ---
 // Requires signatures: officers may be offline, and a JPEG with blank
 // signature lines must never be attached to LHIMS by mistake.
-export async function downloadReferralForm(referral) {
+export async function renderReferralFormJpegBlob(referral) {
   const canvas = await renderReferralFormCanvas(referral, {
     requireSignatures: true,
   });
-  const blob = await new Promise((resolve) =>
-    canvas.toBlob(resolve, "image/jpeg", 0.92),
-  );
-  if (!blob) throw new Error("Could not create the referral JPEG.");
+  try {
+    const blob = await new Promise((resolve) =>
+      canvas.toBlob(resolve, "image/jpeg", 0.92),
+    );
+    if (!blob) throw new Error("Could not create the referral JPEG.");
+    return blob;
+  } finally {
+    canvas.width = 0;
+    canvas.height = 0;
+  }
+}
 
+// --- Single-form download (used by OfficerApp) ---
+export async function downloadReferralForm(referral) {
+  const blob = await renderReferralFormJpegBlob(referral);
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
