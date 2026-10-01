@@ -14,12 +14,25 @@ globalThis.LA_CONFIG = {
   NAME_CHECK: "warn", // "strict" | "warn" | "off"
   VERIFY_BYTES: "warn", // "strict" | "warn" | "off": stored file size vs sent file size
   LINKS_PER_ATTACHMENT: null, // set to 1 or 2 after the first DEBUG save (catches duplicate uploads)
+
+  // Row background classification when a patient has several visits in the results.
+  // Hue in degrees, read from the row's computed background colour.
+  ROW_COLOR: {
+    minChroma: 0.04, // below this = white/grey = "other"
+    red: [
+      [0, 20],
+      [340, 360],
+    ], // UNVERIFIED: no red row seen yet
+    yellow: [[38, 68]], // measured from screenshot: 55 degrees
+    green: [[68, 170]], // measured from screenshot: 83 degrees
+  },
+
   MAX_BYTES: 3 * 1024 * 1024,
-  SETTLE_MS: 1500, // quiet period before declaring "zero results"
+  SETTLE_MS: 1500, // quiet period after Search before choosing a row
   STAGE_TIMEOUT_MIN: 2, // watchdog (chrome.alarms) per automatic stage
   VERIFY_TIMEOUT_MIN: 3, // watchdog from Save click to verification
   BREAKER_MAX_FAILS: 3,
-  DEBUG: true,
+  DEBUG: false,
 
   // Every selector lives here. "ev" = evidence, "WEAK" = not proven.
   SELECTORS: {

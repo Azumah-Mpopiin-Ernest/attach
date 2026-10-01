@@ -41,6 +41,7 @@ globalThis.LA_Badge = (() => {
     MULTIPLE_MATCHES: "Several matches: skip in the app.",
     TIMEOUT: "Timed out. Finish manually or skip in the app.",
     TAB_CLOSED: "Tab was closed. Restart from the app.",
+    NO_USABLE_ROW: "All matching rows are green or red: skip in the app.",
   };
 
   let host, els, handlers;

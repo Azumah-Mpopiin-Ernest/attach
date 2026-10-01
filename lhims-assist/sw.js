@@ -19,7 +19,12 @@ const REPORTABLE = new Set([
   "READY_FOR_SAVE",
   ...TERMINAL,
 ]);
-const NO_BREAKER = new Set(["NO_MATCH", "MULTIPLE_MATCHES", "TAB_CLOSED"]);
+const NO_BREAKER = new Set([
+  "NO_MATCH",
+  "MULTIPLE_MATCHES",
+  "TAB_CLOSED",
+  "NO_USABLE_ROW",
+]);
 const PATCH_KEYS = [
   "reason",
   "scheduleId",

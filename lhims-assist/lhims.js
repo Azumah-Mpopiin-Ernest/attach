@@ -161,7 +161,52 @@
     return r.job;
   }
 
-  // ---------- steps 1-3: search, exact match, open attachment page ----------
+  // ---------- row colour (green / red = skip, yellow = preferred) ----------
+  const parseRgb = (s) => {
+    const m = (s || "").match(/rgba?\(([^)]+)\)/);
+    if (!m) return null;
+    const [r, g, b, a = 1] = m[1]
+      .split(/[ ,/]+/)
+      .filter(Boolean)
+      .map(Number);
+    return { r, g, b, a };
+  };
+  const inRanges = (h, ranges) => ranges.some(([lo, hi]) => h >= lo && h < hi);
+  function classifyColor(c) {
+    if (!c) return "other";
+    const r = c.r / 255,
+      g = c.g / 255,
+      b = c.b / 255;
+    const max = Math.max(r, g, b),
+      min = Math.min(r, g, b),
+      d = max - min;
+    if (d < C.ROW_COLOR.minChroma) return "other"; // white / grey
+    let h =
+      max === r
+        ? ((g - b) / d) % 6
+        : max === g
+          ? (b - r) / d + 2
+          : (r - g) / d + 4;
+    h = (h * 60 + 360) % 360;
+    if (inRanges(h, C.ROW_COLOR.red)) return "red";
+    if (inRanges(h, C.ROW_COLOR.yellow)) return "yellow";
+    if (inRanges(h, C.ROW_COLOR.green)) return "green";
+    return "other";
+  }
+  function rowColor(block) {
+    // nearest coloured background: the row block, then its ancestors up to the <tr>
+    for (let n = block; n; n = n.parentElement) {
+      const c = parseRgb(getComputedStyle(n).backgroundColor);
+      if (c && c.a > 0.05) {
+        const k = classifyColor(c);
+        if (k !== "other") return k;
+      }
+      if (n.tagName === "TR") break;
+    }
+    return "other";
+  }
+
+  // ---------- steps 1-3: search, pick the right visit, open attachment page ----------
   async function doSearch(job) {
     await progress("SEARCHING");
     const sel = document.querySelector(S.list.patientSelect);
@@ -172,9 +217,7 @@
       return m && norm(m[1]) === want;
     });
     if (opts.length === 0) throw new Problem("NEEDS_ATTENTION", "NO_MATCH");
-    if (opts.length > 1)
-      throw new Problem("NEEDS_ATTENTION", "MULTIPLE_MATCHES");
-    setNative(sel, opts[0].value);
+    setNative(sel, opts[0].value); // duplicates in the dropdown: the first one is used
     if (sel.value !== opts[0].value)
       throw new Problem("NEEDS_ATTENTION", "SELECT_NOT_SET");
     const btn = one("searchButton", S.list.searchButton);
@@ -187,27 +230,51 @@
     const grid = document.querySelector(S.list.grid);
     if (!grid) throw new Problem("NEEDS_ATTENTION", "SELECTOR_grid_0");
     const want = norm(job.patientId);
-    const matches = () =>
-      vis(S.list.patientLink, grid).filter(
-        (a) => norm(a.dataset.patientNo) === want,
-      );
     await new Promise((r) => setTimeout(r, 300));
-    let m = matches();
-    if (m.length === 0) {
-      await quietFor(grid, C.SETTLE_MS);
-      guard();
-      m = matches();
+    await quietFor(grid, C.SETTLE_MS); // always: all result rows must be rendered before one is chosen
+    guard();
+
+    const found = vis(S.list.patientLink, grid).filter(
+      (a) => norm(a.dataset.patientNo) === want,
+    );
+    if (found.length === 0) throw new Problem("NEEDS_ATTENTION", "NO_MATCH");
+    const rows = found
+      .map((a) => {
+        const block = a.closest(S.list.rowBlock);
+        return { block, color: block ? rowColor(block) : "other" };
+      })
+      .filter((r) => r.block);
+    if (rows.length === 0)
+      throw new Problem("NEEDS_ATTENTION", "SELECTOR_rowBlock_0");
+    rows.forEach((r, i) =>
+      dbg(
+        "row",
+        i,
+        r.color,
+        r.block.className,
+        getComputedStyle(r.block).backgroundColor,
+      ),
+    );
+
+    let pick,
+      how = "";
+    if (rows.length === 1) pick = rows[0];
+    else {
+      const open = rows.filter((r) => r.color !== "red" && r.color !== "green");
+      pick = open.find((r) => r.color === "yellow") || open[0];
+      if (!pick) throw new Problem("NEEDS_ATTENTION", "NO_USABLE_ROW");
+      how = `${rows.length} visits found; used the ${pick.color === "yellow" ? "yellow" : "first"} one`;
     }
-    if (m.length === 0) throw new Problem("NEEDS_ATTENTION", "NO_MATCH");
-    if (m.length > 1) throw new Problem("NEEDS_ATTENTION", "MULTIPLE_MATCHES");
-    const block = m[0].closest(S.list.rowBlock);
-    if (!block) throw new Problem("NEEDS_ATTENTION", "SELECTOR_rowBlock_0");
-    const icon = one("updateIcon", S.list.updateIcon, block); // this row only
+
+    const icon = one("updateIcon", S.list.updateIcon, pick.block); // this row only
     const sid = (icon.getAttribute("onclick") || "").match(
       /fUpdateSchedule\(\s*(\d+)/,
     )?.[1];
     if (!sid) throw new Problem("NEEDS_ATTENTION", "SCHEDULE_ID_UNREADABLE");
-    await progress("MATCHED", { scheduleId: sid });
+    await progress("MATCHED", {
+      scheduleId: sid,
+      ...(how ? { warn: how } : {}),
+    });
     icon.click(); // same-tab navigation; the next page load resumes
   }
 
@@ -578,3 +645,5 @@
     }
   })();
 })();
+
+
