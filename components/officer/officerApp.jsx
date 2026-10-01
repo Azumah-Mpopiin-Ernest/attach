@@ -23,6 +23,7 @@ import {
 } from "./referralFlow";
 import { useLhimsRun } from "../../src/lhims/useLhimsRun";
 import LhimsRunBar from "../../src/lhims/LhimsRunBar";
+import { saveSkipNote, clearSkipNote } from "../../src/lhims/skipNotes";
 
 const PAGE_SIZE = 25;
 
@@ -295,6 +296,7 @@ export default function OfficerApp({ officerName, onSignOut }) {
     setPendingDone(null);
     setError("");
     clearReferralActions(referral.id);
+    clearSkipNote(referral.id);
     formsFolder.removeForm(referral);
     setUnsynced((count) => count + 1);
     adjustDoneCount(1);
@@ -307,13 +309,15 @@ export default function OfficerApp({ officerName, onSignOut }) {
   };
 
   // Same optimistic pattern. Only an ASSIGNED referral owned by this officer
-  // may become SKIPPED (enforced by the security rules).
-  const skipReferral = (referral) => {
+  // may become SKIPPED (enforced by the security rules). `note` (from the
+  // auto run) explains why, and is shown in the Skipped Referrals tab.
+  const skipReferral = (referral, note) => {
     if (!referral) return;
     const label = referralName(referral, "referral");
     setPendingSkip(null);
     setError("");
     clearReferralActions(referral.id);
+    if (note) saveSkipNote(referral.id, note);
     formsFolder.removeForm(referral);
     setUnsynced((count) => count + 1);
     updateReferral(referral.id, { status: "SKIPPED" })
@@ -324,7 +328,8 @@ export default function OfficerApp({ officerName, onSignOut }) {
   };
 
   // Drives the extension's auto run: sends the next form, marks each
-  // referral done once LHIMS verified it, skips the ones with no match.
+  // referral done once LHIMS verified it, and skips (with the reason) any
+  // referral that ends in a problem so the run keeps going.
   const lhimsRun = useLhimsRun({ queue, queueLoaded, markDone, skipReferral });
 
   return (

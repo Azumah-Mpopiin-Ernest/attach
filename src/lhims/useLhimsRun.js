@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { getDateKey } from "../referralDates";
 import { request, subscribe } from "./lhimsBridge";
 import { buildJob } from "./lhimsJob";
+import { describeProblem } from "./skipNotes";
 
 const TERMINAL = new Set([
   "VERIFIED",
@@ -11,7 +12,8 @@ const TERMINAL = new Set([
   "LOGGED_OUT",
   "EXTENSION_ERROR",
 ]);
-const NORMAL_SKIPS = new Set(["NO_MATCH", "NO_USABLE_ROW"]);
+// These stop the whole run and leave the referral in the queue (every following referral would fail the same way).
+const HARD_STOPS = new Set(["LOGGED_OUT", "EXTENSION_ERROR"]);
 const BAD_DATA = new Set(["BAD_PATIENT_ID", "BAD_FILE_NAME"]); // this referral cannot be automated: skip it, keep going
 const START_ERRORS = {
   NO_START_REQUEST:
@@ -32,8 +34,11 @@ function toLhimsDate(key) {
 
 /**
  * Drives the extension's auto run from the officer's queue:
- * sends the next referral's form, marks it done once LHIMS verified it, skips
- * referrals that have no match, and stops when the queue is empty.
+ * sends the next referral's form, marks it done once LHIMS verified it, and
+ * SKIPS (with the reason) any referral that ends in a problem, so one bad
+ * referral never holds up the rest. Stops when the queue is empty.
+ *
+ * `skipReferral(referral, note)` must store the note for the skipped list.
  */
 export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
   const [present, setPresent] = useState(false);
@@ -104,21 +109,27 @@ export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
     };
   }, [startRun]);
 
-  // outcome of the current auto job: done on VERIFIED, skip on a normal "no match"
+  // outcome of the current auto job: done on VERIFIED, otherwise skip with the reason
   useEffect(() => {
     const id = ext.referralId;
-    if (!ext.auto || !id || processed.current.has(id)) return;
+    if (
+      !ext.auto ||
+      !id ||
+      processed.current.has(id) ||
+      !TERMINAL.has(ext.stage)
+    )
+      return;
     const referral = queueRef.current.find((r) => r.id === id);
     if (!referral) return;
     if (ext.stage === "VERIFIED") {
       processed.current.add(id);
       actionsRef.current.markDone(referral);
-    } else if (
-      ext.stage === "NEEDS_ATTENTION" &&
-      NORMAL_SKIPS.has(ext.reason)
-    ) {
+    } else if (!HARD_STOPS.has(ext.stage)) {
       processed.current.add(id);
-      actionsRef.current.skipReferral(referral);
+      actionsRef.current.skipReferral(
+        referral,
+        describeProblem(ext.stage, ext.reason),
+      );
     }
   }, [ext]);
 
@@ -157,7 +168,10 @@ export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
         if (res.ok || res.error === "RUN_STOPPING") return;
         if (BAD_DATA.has(res.error)) {
           processed.current.add(next.id);
-          actionsRef.current.skipReferral(next);
+          actionsRef.current.skipReferral(
+            next,
+            `The patient ID or name is not in a format the extension can use (${res.error}).`,
+          );
           return;
         }
         await stop(res.error);

@@ -3,6 +3,7 @@ import { Check, CheckCircle2, Copy, Download, SkipForward } from "lucide-react";
 import { formatDateLabel, getDateKey } from "../../src/referralDates";
 import { referralName, useReferralActions } from "./referralFlow";
 import { useLhimsAutomation } from "../../src/lhims/useLhimsAutomation";
+import { readSkipNote } from "../../src/lhims/skipNotes";
 
 const BUTTON_BASE =
   "inline-flex items-center justify-center gap-1.5 rounded-md border font-medium transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400 disabled:cursor-not-allowed";
@@ -196,7 +197,8 @@ const STAGE_TEXT = {
   READY_FOR_SAVE: "Check the LHIMS page, then click Save there.",
   SAVE_CLICKED: "Save clicked. Confirming…",
   VERIFIED: "Verified in LHIMS. You can mark this done.",
-  MISMATCH: "Wrong patient detected. Do not save. Nothing was attached.",
+  MISMATCH:
+    "The visit that opened did not match the one chosen from the list. Nothing was saved.",
   UNVERIFIED:
     "The save couldn't be confirmed. Check the attachment in LHIMS before marking done.",
   LOGGED_OUT: "LHIMS is logged out. Log in, then retry.",
@@ -220,8 +222,6 @@ const REASON_TEXT = {
   TAB_CLOSED: "The LHIMS tab was closed. Retry.",
   ALREADY_ATTACHED:
     "This visit already shows the referral note. Check LHIMS: if it is the right file, confirm below, otherwise skip.",
-  NAME_NOT_VERIFIABLE:
-    "The patient name could not be read in LHIMS. Check this referral.",
   UNEXPECTED_DIALOG:
     "LHIMS showed a message the extension did not expect. Look at the LHIMS page.",
   NO_BASELINE:
@@ -450,7 +450,8 @@ export function ActiveReferralCard({
 /**
  * One row of the Skipped tab. Same safeguards as the active card: Mark Done
  * stays locked until this referral's ID is copied, its form downloaded, and
- * the 10 second countdown has run out.
+ * the 10 second countdown has run out. When the auto run skipped the
+ * referral, the reason is shown so the officer can review it.
  */
 export function SkippedReferralRow({
   referral,
@@ -460,6 +461,7 @@ export function SkippedReferralRow({
 }) {
   const { actions, downloading, unlocked, secondsLeft, copyId, download } =
     useReferralActions(referral, onError, formsFolder);
+  const reviewNote = readSkipNote(referral.id);
 
   return (
     <li className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3 border-b border-slate-100 px-5 py-4 last:border-0">
@@ -474,6 +476,12 @@ export function SkippedReferralRow({
           ID {referral.patientId ?? "—"}, NHIS {referral.nhis ?? "—"}, dated{" "}
           {formatDateLabel(getDateKey(referral))}
         </p>
+        {reviewNote && (
+          <p className="mt-1.5 max-w-xl rounded border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-xs text-amber-900">
+            <span className="font-semibold">Why it was skipped:</span>{" "}
+            {reviewNote}
+          </p>
+        )}
       </div>
       <div className="flex flex-wrap justify-end gap-2">
         <CopyIdButton size="sm" done={actions.idCopied} onClick={copyId} />

@@ -6,19 +6,15 @@ const STOP_TEXT = {
   NO_READY_TAB:
     "No LHIMS list tab became ready. Check that the tabs open the patient list, then start again.",
   APP_CLOSED: "The app tab was closed, so the run stopped.",
-  MISMATCH:
-    "Stopped: the wrong patient was detected. Nothing was saved for it. Acknowledge, then check this referral.",
-  UNVERIFIED:
-    "Stopped: the save could not be confirmed. Check this patient's attachments in LHIMS before doing anything.",
-  ALREADY_ATTACHED:
-    "Stopped: this visit already shows the referral note. Check LHIMS, then use Mark Done or Skip on the card.",
-  LOGGED_OUT: "Stopped: LHIMS is logged out. Log in and start again.",
-  UNEXPECTED_DIALOG:
-    "Stopped: LHIMS showed a message the extension did not expect. Look at the LHIMS page.",
+  LOGGED_OUT:
+    "Stopped: LHIMS is logged out. Log in and start again. The referral it was on is still in your queue.",
+  EXTENSION_ERROR:
+    "Stopped: the extension hit an error. The referral it was on is still in your queue.",
+  TOO_MANY_PROBLEMS:
+    "Stopped: several referrals in a row had problems, so something may be wrong. Check the Skipped Referrals tab, then start again.",
   FORM_RENDER_FAILED:
     "Stopped: the form could not be prepared (signatures may not be saved on this device).",
-  NAME_MISMATCH:
-    "Stopped: the patient name in LHIMS does not match the referral. Check this referral.",
+  BAD_DATE: "Stopped: a referral has a date the extension cannot use.",
 };
 
 export default function LhimsRunBar({ lhims }) {
@@ -34,11 +30,11 @@ export default function LhimsRunBar({ lhims }) {
   if (!present) return null;
   const active = run && (run.status === "RUNNING" || run.status === "STOPPING");
   const stopped = run?.status === "STOPPED";
+  const calm = ["DONE", "OFFICER_STOP"].includes(run?.stopReason);
 
   let tone = "border-slate-200 bg-slate-50 text-slate-700";
   if (active) tone = "border-sky-200 bg-sky-50 text-sky-900";
-  else if (stopped && !["DONE", "OFFICER_STOP"].includes(run.stopReason))
-    tone = "border-rose-200 bg-rose-50 text-rose-900";
+  else if (stopped && !calm) tone = "border-rose-200 bg-rose-50 text-rose-900";
 
   return (
     <section
@@ -61,6 +57,12 @@ export default function LhimsRunBar({ lhims }) {
               {stopped
                 ? STOP_TEXT[run.stopReason] || `Stopped (${run.stopReason}).`
                 : "In LHIMS, open the Filter Selection page and press “Start auto run” on the extension badge."}
+            </p>
+          )}
+          {stopped && run.skipped > 0 && (
+            <p className="mt-0.5">
+              Done {run.done} · skipped {run.skipped}. Open the Skipped
+              Referrals tab to review why.
             </p>
           )}
           {startError && (
