@@ -243,20 +243,6 @@
     return "other";
   }
 
-  // ---------- name comparison (order and middle names tolerated) ----------
-  const tokens = (s) =>
-    norm(String(s).replace(/[<>:"/\\|?*.,'’-]/g, " "))
-      .split(" ")
-      .filter(Boolean);
-  function namesAgree(a, b) {
-    const X = tokens(a),
-      Y = tokens(b);
-    if (!X.length || !Y.length) return false;
-    const [small, big] = X.length <= Y.length ? [X, Y] : [Y, X];
-    if (small.length < 2 && X.length !== Y.length) return false;
-    return small.every((t) => big.includes(t));
-  }
-
   // ---------- steps 1-3: search, pick the right visit, open attachment page ----------
   async function doSearch(job) {
     await progress("SEARCHING");
@@ -268,11 +254,11 @@
       return m && norm(m[1]) === want;
     });
     if (opts.length === 0) throw new Problem("NEEDS_ATTENTION", "NO_MATCH");
-    setNative(sel, opts[0].value);
+    setNative(sel, opts[0].value); // duplicates in the dropdown: the first one is used
     if (sel.value !== opts[0].value)
       throw new Problem("NEEDS_ATTENTION", "SELECT_NOT_SET");
     const btn = one("searchButton", S.list.searchButton);
-    await progress("SEARCHING", { searchClicked: true });
+    await progress("SEARCHING", { searchClicked: true }); // persisted before the click: the page may reload
     btn.click();
     return evaluateResults(job);
   }
@@ -282,7 +268,7 @@
     if (!grid) throw new Problem("NEEDS_ATTENTION", "SELECTOR_grid_0");
     const want = norm(job.patientId);
     await new Promise((r) => setTimeout(r, 300));
-    await quietFor(grid, C.SETTLE_MS);
+    await quietFor(grid, C.SETTLE_MS); // always: all result rows must be rendered before one is chosen
     guard();
 
     const found = vis(S.list.patientLink, grid).filter(
@@ -317,7 +303,7 @@
       how = `${rows.length} visits found; used the ${pick.color === "yellow" ? "yellow" : "first"} one`;
     }
 
-    const icon = one("updateIcon", S.list.updateIcon, pick.block);
+    const icon = one("updateIcon", S.list.updateIcon, pick.block); // this row only
     const sid = (icon.getAttribute("onclick") || "").match(
       /fUpdateSchedule\(\s*(\d+)/,
     )?.[1];
@@ -349,6 +335,7 @@
     );
 
   async function captureBaseline(job) {
+    // read-only GET of this visit's view page, same origin
     try {
       const u = new URL(C.PAGES.view, location.href);
       u.searchParams.set("iScheduleID", String(job.scheduleId));
@@ -361,7 +348,7 @@
         await res.text(),
         "text/html",
       );
-      if (!doc.querySelector(S.session.loggedIn)) return null;
+      if (!doc.querySelector(S.session.loggedIn)) return null; // login redirect or error page
       const hrefs = hrefsIn(doc);
       try {
         sessionStorage.setItem(baseKey(job), JSON.stringify(hrefs));
@@ -382,6 +369,7 @@
       /* ignore */
     }
     await loaded();
+    // Identity: the visit opened must be the one chosen from the exact-ID row.
     if (
       new URL(location.href).searchParams.get("iScheduleID") !==
       String(job.scheduleId)
@@ -390,27 +378,7 @@
     const hid = document.querySelector(S.update.scheduleIdHidden);
     if (hid && hid.value !== String(job.scheduleId))
       throw new Problem("MISMATCH", "SCHEDULE_ID_MISMATCH_FORM");
-
-    let warn = null;
-    const nameMode = job.auto ? "strict" : C.NAME_CHECK;
-    if (nameMode !== "off") {
-      const named = all(S.update.patientName).filter((e) =>
-        e.textContent.trim(),
-      );
-      const el = named.find(visible) || named[0]; // the name is in the DOM even when its tab is not shown
-      dbg("name element", named.length, !!el && visible(el));
-      const wantName = job.expectedFileName.replace(/\.[^.]+$/, "");
-      if (!el) {
-        if (nameMode === "strict")
-          throw new Problem("NEEDS_ATTENTION", "NAME_NOT_VERIFIABLE");
-        warn = "name not verifiable";
-      } else if (!namesAgree(el.textContent, wantName)) {
-        if (nameMode === "strict")
-          throw new Problem("MISMATCH", "NAME_MISMATCH");
-        warn = "name differs from referral";
-      }
-    }
-    await progress("ON_ATTACHMENT_PAGE", warn ? { warn } : {});
+    await progress("ON_ATTACHMENT_PAGE");
 
     await waitFor(
       () =>
@@ -535,8 +503,8 @@
           sessionStorage.setItem(saveKey(job), String(Date.now()));
         } catch {
           /* ignore */
-        }
-        const fieldsOk = readback().ok;
+        } // survives the redirect
+        const fieldsOk = readback().ok; // observed only, never blocks the officer
         sw({ type: "SAVE_CLICKED", fieldsOk })
           .then((r) => {
             if (r?.ok) {
@@ -565,7 +533,7 @@
         throw new Problem("UNVERIFIED", "WRONG_SCHEDULE_AFTER_SAVE");
       if (job.baseline == null) throw new Problem("UNVERIFIED", "NO_BASELINE");
 
-      const links = all(S.verify.downloadLink);
+      const links = all(S.verify.downloadLink); // no visibility filter: baseline was parsed from raw HTML
       const delta = links.length - job.baseline;
       dbg("links before/after/delta", job.baseline, links.length, delta);
       if (delta <= 0) throw new Problem("UNVERIFIED", "NO_NEW_ATTACHMENT");
@@ -625,7 +593,7 @@
     if (page === "LIST") {
       if (st === "TAB_CLAIMED" || (st === "SEARCHING" && !job.searchClicked))
         return doSearch(job);
-      if (st === "SEARCHING") return evaluateResults(job);
+      if (st === "SEARCHING") return evaluateResults(job); // page reloaded after the search click
       if (st === "SAVE_CLICKED")
         throw new Problem("UNVERIFIED", "NAVIGATED_AWAY_AFTER_SAVE");
       throw new Problem("NEEDS_ATTENTION", "UNEXPECTED_PAGE");
@@ -639,8 +607,10 @@
       throw new Problem("NEEDS_ATTENTION", "UNEXPECTED_PAGE");
     }
     if (page === "VIEW") {
+      // Save succeeded and LHIMS redirected here
       if (st === "SAVE_CLICKED") return verifyAfterSave(job);
       if (st === "READY_FOR_SAVE" && sessionStorage.getItem(saveKey(job))) {
+        // the Save message never reached the SW
         const r = await sw({ type: "SAVE_CLICKED", fieldsOk: null });
         if (r?.ok) {
           state = r.state;
@@ -686,7 +656,7 @@
 
   // ---------- boot ----------
   async function adoptJob() {
-    // called after a page load or an AUTO_GO message
+    // called after an AUTO_GO message
     const r = await sw({
       type: "HELLO",
       page: pageKind(),

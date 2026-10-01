@@ -16,7 +16,6 @@ globalThis.LA_CONFIG = {
 
   NOTE_TEXT: "Internal Referral Form",
   ATTACHMENT_TYPE_TEXT: "Referral",
-  NAME_CHECK: "warn", // manual mode only. Auto mode is always strict.
   VERIFY_BYTES: "warn", // manual mode only. Auto mode is always strict.
   LINKS_PER_ATTACHMENT: null, // set to 1 or 2 once you know it (catches duplicate uploads)
 
@@ -31,13 +30,16 @@ globalThis.LA_CONFIG = {
   },
 
   AUTO: {
-    POOL_SIZE: 10, // use 2 for the first tests
+    POOL_SIZE: 2, // use 2 for the first tests
     CLOSE_POOL_ON_STOP: true, // close the pool tabs after Stop / DONE (kept after a problem)
     ACTIVATE_TAB: true, // bring the claimed tab to the front (avoids background-tab throttling)
     READY_TAB_TIMEOUT_MIN: 6, // stop if no list tab becomes ready for a waiting job
-    STOP_IF_NOTE_PRESENT: true, // refuse to attach if the visit already shows the note text
-    NORMAL_SKIPS: ["NO_MATCH", "NO_USABLE_ROW"], // skip the referral in the app and continue
-    // Exact dialog texts auto-accepted (lower case, spaces collapsed). Anything else is refused and stops the run.
+    STOP_IF_NOTE_PRESENT: true, // visit already shows the note text: skip it for review
+    // A problem with ONE referral never stops the run: the app skips it with the reason and the run moves on.
+    HARD_STOPS: ["LOGGED_OUT", "EXTENSION_ERROR"], // these stop everything; the referral stays in the queue
+    BENIGN: ["NO_MATCH", "NO_USABLE_ROW", "ALREADY_ATTACHED"], // expected outcomes: not counted as failures
+    MAX_CONSECUTIVE_PROBLEMS: 4, // this many real problems in a row stops the run (systematic fault)
+    // Exact dialog texts auto-accepted (lower case, spaces collapsed). Anything else is refused.
     CONFIRMS: [
       "do you really want to update the schedule?",
       "do you really want to save ?",

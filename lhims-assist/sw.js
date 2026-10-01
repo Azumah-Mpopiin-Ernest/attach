@@ -20,7 +20,8 @@ const REPORTABLE = new Set([
   "READY_FOR_SAVE",
   ...TERMINAL,
 ]);
-const NORMAL_SKIP = new Set(A.NORMAL_SKIPS);
+const HARD_STOP = new Set(A.HARD_STOPS);
+const BENIGN = new Set(A.BENIGN);
 const NO_BREAKER = new Set([
   "NO_MATCH",
   "MULTIPLE_MATCHES",
@@ -178,6 +179,7 @@ async function arm(job) {
 async function onTerminal(job) {
   await store.remove("blob"); // bytes never outlive the job
   await chrome.alarms.clear("wd");
+  if (job.auto) return; // auto runs use the consecutive-problem limit (afterTerminal) instead of the breaker
   const b = await read("breaker", DEFAULT_BREAKER);
   if (job.stage === "VERIFIED") b.fails = 0;
   else if (job.stage === "MISMATCH") b.tripped = true;
@@ -306,19 +308,27 @@ async function recycle(tabId, run) {
   chrome.tabs.update(tabId, { url: listUrl(run, run.date) }).catch(() => {});
 }
 
+// A referral that ends without VERIFIED is skipped by the app (with the reason); the run carries on.
+// Only HARD_STOPS, or too many real problems in a row, stop the run.
 async function afterTerminal(job) {
   const run = await read("run");
   if (!job.auto || !ACTIVE(run)) return;
-  const normalSkip =
-    job.stage === "NEEDS_ATTENTION" && NORMAL_SKIP.has(job.reason);
-  if (job.stage !== "VERIFIED" && !normalSkip)
-    return finishRun(job.reason || job.stage, true); // problem: stop, keep the tabs
+  if (HARD_STOP.has(job.stage)) return finishRun(job.reason || job.stage, true); // referral stays in the queue
+  const verified = job.stage === "VERIFIED";
+  const benign = BENIGN.has(job.reason);
   const next = {
     ...run,
-    done: run.done + (job.stage === "VERIFIED" ? 1 : 0),
-    skipped: run.skipped + (normalSkip ? 1 : 0),
+    done: run.done + (verified ? 1 : 0),
+    skipped: run.skipped + (verified ? 0 : 1),
+    problems: verified
+      ? 0
+      : benign
+        ? run.problems || 0
+        : (run.problems || 0) + 1,
   };
   await store.set({ run: next });
+  if (next.problems >= A.MAX_CONSECUTIVE_PROBLEMS)
+    return finishRun("TOO_MANY_PROBLEMS", true);
   if (run.status === "STOPPING")
     return finishRun(run.stopReason || "OFFICER_STOP", false);
   await recycle(job.claimedTabId, next);
@@ -458,6 +468,7 @@ async function startRun(p, sender, job, breaker, run) {
       date: p.date,
       done: 0,
       skipped: 0,
+      problems: 0,
       stopReason: null,
       startedAt: Date.now(),
     },

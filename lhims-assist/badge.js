@@ -53,6 +53,8 @@ globalThis.LA_Badge = (() => {
     OFFICER_STOP: "Stopped.",
     NO_READY_TAB: "No list tab became ready. Check the tabs, then start again.",
     APP_CLOSED: "The app tab was closed, so the run stopped.",
+    TOO_MANY_PROBLEMS:
+      "Stopped: several referrals in a row had problems. Check the Skipped Referrals tab in the app.",
   };
 
   let host, els, handlers;
