@@ -138,7 +138,12 @@ export async function renderReferralFormPngBytes(referral) {
   }
 }
 
-// --- Officer form as a JPEG blob (used by the download and the drag preview) ---
+// File name of the officer's JPEG (download and drag test).
+export function referralFormFileName(referral) {
+  return `${safeFileName(nameOf(referral))}.jpg`;
+}
+
+// --- Officer form as a JPEG blob (used by the download and the drag test) ---
 // Requires signatures: officers may be offline, and a JPEG with blank
 // signature lines must never be attached to LHIMS by mistake.
 export async function renderReferralFormJpegBlob(referral) {
@@ -163,7 +168,7 @@ export async function downloadReferralForm(referral) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = `${safeFileName(nameOf(referral))}.jpg`;
+  anchor.download = referralFormFileName(referral);
   anchor.click();
   // Revoking immediately can cancel the download in some browsers.
   setTimeout(() => URL.revokeObjectURL(url), 1000);

@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, CheckCircle2, Copy, Download, SkipForward } from "lucide-react";
 import { formatDateLabel, getDateKey } from "../../src/referralDates";
-import { renderReferralFormJpegBlob } from "../../src/referralForm";
+import {
+  referralFormFileName,
+  renderReferralFormJpegBlob,
+} from "../../src/referralForm";
 import { referralName, useReferralActions } from "./referralFlow";
 
 const BUTTON_BASE =
@@ -13,7 +16,7 @@ const SIZE_CLASSES = {
 const ICON_CLASSES = { sm: "h-3.5 w-3.5", lg: "h-4 w-4" };
 const LOCKED_CLASSES = "border-transparent bg-slate-200 text-slate-400";
 const LOCKED_TITLE =
-  "Copy the ID, download or drag the form, and try the upload in LHIMS first";
+  "Copy the ID, download the form and try the upload in LHIMS first";
 
 function withCountdown(label, secondsLeft) {
   return secondsLeft > 0 ? `${label} (${secondsLeft}s)` : label;
@@ -96,35 +99,36 @@ function SkipButton({ unlocked, secondsLeft, onClick }) {
   );
 }
 
-function FormStatusBadge({ actions }) {
-  let label = null;
-  if (actions.fileDownloaded) label = "Downloaded";
-  else if (actions.fileDragged) label = "Form dragged";
-  if (!label) return null;
-
+function DownloadedBadge() {
   return (
     <span
       role="status"
       className="inline-flex items-center gap-1 rounded-full bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white"
     >
       <CheckCircle2 className="h-3.5 w-3.5" />
-      {label}
+      Downloaded
     </span>
   );
 }
 
-// A preview of the exact JPEG that Download Form saves, which the officer
-// can drag straight into LHIMS's attachment drop area. The picture IS the
-// form for the patient on screen, so there is no file picker or Downloads
-// folder to get the wrong file from.
+// DRAG TEST. A plain dragged <img> gives LHIMS no real file, so this drags a
+// file chip that declares itself a downloadable JPEG with an explicit name
+// (the "DownloadURL" drag type, supported by Chrome and Edge). On Windows the
+// browser turns that into a real file when the drop target asks for it.
+// Nothing here unlocks Mark Done; Download Form is still required.
 //
-// It is rendered once per referral (keyed by id, with the latest referral
-// read from a ref) so a Firestore snapshot arriving mid-drag can't replace
-// or revoke the image being dragged. Signatures are required, exactly as for
-// the download: a form with blank signature lines must never be attachable.
-function FormPreview({ referral, onDragged }) {
+// Rendered once per referral (the latest referral is read from a ref) so a
+// Firestore snapshot arriving mid-drag can't replace or revoke the file being
+// dragged. Signatures are required, exactly as for the download.
+function FormPreview({ referral }) {
   const referralRef = useRef(referral);
-  const [preview, setPreview] = useState({ url: null, error: "" });
+  const imageRef = useRef(null);
+  const [preview, setPreview] = useState({
+    url: null,
+    fileName: "",
+    error: "",
+  });
+  const [dragResult, setDragResult] = useState(null);
 
   useEffect(() => {
     referralRef.current = referral;
@@ -137,10 +141,16 @@ function FormPreview({ referral, onDragged }) {
       .then((blob) => {
         if (!active) return;
         objectUrl = URL.createObjectURL(blob);
-        setPreview({ url: objectUrl, error: "" });
+        setPreview({
+          url: objectUrl,
+          fileName: referralFormFileName(referralRef.current),
+          error: "",
+        });
       })
       .catch((previewError) => {
-        if (active) setPreview({ url: null, error: previewError.message });
+        if (active) {
+          setPreview({ url: null, fileName: "", error: previewError.message });
+        }
       });
     return () => {
       active = false;
@@ -148,36 +158,57 @@ function FormPreview({ referral, onDragged }) {
     };
   }, [referral.id]);
 
+  const handleDragStart = (event) => {
+    const { dataTransfer } = event;
+    dataTransfer.effectAllowed = "copy";
+    dataTransfer.setData(
+      "DownloadURL",
+      `image/jpeg:${preview.fileName}:${preview.url}`,
+    );
+    if (imageRef.current) dataTransfer.setDragImage(imageRef.current, 24, 24);
+    setDragResult(null);
+  };
+
+  const handleDragEnd = (event) => {
+    // "none" means nothing accepted the drop.
+    setDragResult(
+      event.dataTransfer.dropEffect === "none" ? "rejected" : "accepted",
+    );
+  };
+
   let content;
   if (preview.url) {
     content = (
-      <img
-        src={preview.url}
-        alt={`Referral form for ${referralName(referral)}`}
+      <div
         draggable
-        onDragStart={(event) => {
-          event.dataTransfer.effectAllowed = "copy";
-        }}
-        onDragEnd={(event) => {
-          // "none" means nothing accepted the drop (cancelled, or dropped
-          // somewhere that doesn't take files).
-          if (event.dataTransfer.dropEffect !== "none") onDragged();
-        }}
-        className="max-h-64 w-auto max-w-full cursor-grab rounded border border-slate-200 shadow-sm active:cursor-grabbing"
-      />
+        onDragStart={handleDragStart}
+        onDragEnd={handleDragEnd}
+        className="inline-flex max-w-full cursor-grab items-center gap-3 rounded-md border border-slate-300 bg-white p-2 shadow-sm active:cursor-grabbing"
+      >
+        <img
+          ref={imageRef}
+          src={preview.url}
+          alt=""
+          draggable={false}
+          className="h-24 w-auto rounded border border-slate-200"
+        />
+        <span className="break-all pr-2 text-sm font-medium text-slate-700">
+          {preview.fileName}
+        </span>
+      </div>
     );
   } else if (preview.error) {
     content = (
       <p role="alert" className="text-sm text-rose-600">
-        Couldn't prepare the form preview: {preview.error}
+        Couldn't prepare the form: {preview.error}
       </p>
     );
   } else {
     content = (
       <div
         role="status"
-        aria-label="Preparing form preview"
-        className="h-40 w-64 animate-pulse rounded bg-slate-100"
+        aria-label="Preparing form"
+        className="h-24 w-48 animate-pulse rounded bg-slate-100"
       />
     );
   }
@@ -185,13 +216,19 @@ function FormPreview({ referral, onDragged }) {
   return (
     <div className="mt-4 rounded-md border border-dashed border-slate-300 px-4 py-3">
       <p className="text-sm font-medium text-slate-700">
-        Or drag this form into LHIMS
+        Drag test: drag this file into LHIMS
       </p>
       <p className="mt-0.5 text-sm text-slate-500">
-        Drop it on the attachment area in LHIMS. It is the same file Download
-        Form saves.
+        Download Form is still required to unlock Mark Done.
       </p>
       <div className="mt-3">{content}</div>
+      {dragResult && (
+        <p className="mt-2 text-xs text-slate-500">
+          {dragResult === "accepted"
+            ? "The browser reports that the drop was accepted."
+            : "The browser reports that nothing accepted the drop."}
+        </p>
+      )}
     </div>
   );
 }
@@ -257,9 +294,7 @@ function unlockHint({ actions, ready, secondsLeft }) {
   if (!ready) {
     const steps = [];
     if (!actions.idCopied) steps.push("copy the ID");
-    if (!actions.fileDownloaded && !actions.fileDragged) {
-      steps.push("download or drag the form");
-    }
+    if (!actions.fileDownloaded) steps.push("download the form");
     return `Still to do before Mark Done or Skip: ${steps.join(" and ")}.`;
   }
   if (secondsLeft > 0) {
@@ -279,15 +314,8 @@ export function ActiveReferralCard({
   onError,
 }) {
   const flow = useReferralActions(referral, onError);
-  const {
-    actions,
-    downloading,
-    unlocked,
-    secondsLeft,
-    copyId,
-    download,
-    markDragged,
-  } = flow;
+  const { actions, downloading, unlocked, secondsLeft, copyId, download } =
+    flow;
 
   return (
     <article
@@ -301,7 +329,7 @@ export function ActiveReferralCard({
             {formatDateLabel(getDateKey(referral))}
           </span>
         </p>
-        <FormStatusBadge actions={actions} />
+        {actions.fileDownloaded && <DownloadedBadge />}
       </header>
 
       <div className="px-6 py-6">
@@ -336,7 +364,12 @@ export function ActiveReferralCard({
           />
         </div>
 
-        <FormPreview referral={referral} onDragged={markDragged} />
+        <p className="mt-3 text-sm text-slate-500">
+          After Download Form, drag the file from your browser's downloads list
+          straight into LHIMS.
+        </p>
+
+        <FormPreview referral={referral} />
 
         <div className="mt-6 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-5">
           <SkipButton
@@ -374,7 +407,7 @@ export function SkippedReferralRow({ referral, onRequestDone, onError }) {
           <span className="break-words font-medium text-slate-800">
             {referralName(referral, "Unnamed patient")}
           </span>
-          <FormStatusBadge actions={actions} />
+          {actions.fileDownloaded && <DownloadedBadge />}
         </div>
         <p className="mt-0.5 break-all font-mono text-xs text-slate-500">
           ID {referral.patientId ?? "—"}, NHIS {referral.nhis ?? "—"}, dated{" "}
