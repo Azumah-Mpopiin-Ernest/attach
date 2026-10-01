@@ -12,6 +12,8 @@ dist
 dist-ssr
 *.local
 .env
+lhims-assist/config.js
+lhims-assist/manifest.json
 
 # Editor directories and files
 .vscode/*

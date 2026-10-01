@@ -34,7 +34,7 @@ globalThis.LA_CONFIG = {
     CLOSE_POOL_ON_STOP: true, // close the pool tabs after Stop / DONE (kept after a problem)
     ACTIVATE_TAB: true, // bring the claimed tab to the front (avoids background-tab throttling)
     READY_TAB_TIMEOUT_MIN: 6, // stop if no list tab becomes ready for a waiting job
-    STOP_IF_NOTE_PRESENT: false, // TESTING ONLY: set back to true before shipping
+    STOP_IF_NOTE_PRESENT: true, // skip visits that already show the note. Keep true in production.
     // A problem with ONE referral never stops the run: the app skips it with the reason and the run moves on.
     HARD_STOPS: ["LOGGED_OUT", "EXTENSION_ERROR"], // these stop everything; the referral stays in the queue
     BENIGN: ["NO_MATCH", "NO_USABLE_ROW", "ALREADY_ATTACHED"], // expected outcomes: not counted as failures
