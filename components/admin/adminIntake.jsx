@@ -15,6 +15,10 @@ import {
   resetBatchIfEmpty,
 } from "../../src/firebaseData";
 
+// Rows are written in chunks of this size so the progress bar can move after
+// each chunk. Smaller = smoother bar, more round trips.
+const IMPORT_CHUNK_SIZE = 100;
+
 // Stages: "select" -> "review" -> "importing" -> "done"
 //
 // batchFiles tracks every filename imported since the last time "Done" was
@@ -119,33 +123,55 @@ export default function AdminIntake() {
     setStage("importing");
     setProgress(0);
     setError("");
+
+    const total = validRows.length;
+    let imported = 0;
+
     try {
       // Guard against the admin sitting on this page while the previous
       // batch finished: if no referrals remain, start this import on a
       // clean slate rather than on top of the old batch's numbers.
       if (await resetBatchIfEmpty()) setBatchFiles([]);
 
-      await createDocuments(
-        "referrals",
-        validRows.map((row) => ({
-          patientId: row.patientid,
-          name: row.name,
-          nhis: row.nhis,
-          nhiaNo: row.nhiaNo,
-          referralDate: row.referralDate,
-          reason: row.reason,
-          status: "AWAITING_SIGN",
-          createdAt: new Date(),
-        })),
-      );
-      await markFileImported(fileName, validRows.length);
+      const documents = validRows.map((row) => ({
+        patientId: row.patientid,
+        name: row.name,
+        nhis: row.nhis,
+        nhiaNo: row.nhiaNo,
+        referralDate: row.referralDate,
+        reason: row.reason,
+        status: "AWAITING_SIGN",
+        createdAt: new Date(),
+      }));
+
+      // Write in chunks and bump the progress bar after each one.
+      for (
+        let start = 0;
+        start < documents.length;
+        start += IMPORT_CHUNK_SIZE
+      ) {
+        const chunk = documents.slice(start, start + IMPORT_CHUNK_SIZE);
+        await createDocuments("referrals", chunk);
+        imported += chunk.length;
+        setProgress(imported);
+      }
+
+      await markFileImported(fileName, total);
       setBatchFiles((current) =>
         current.includes(fileName) ? current : [...current, fileName],
       );
-      setProgress(validRows.length);
       setStage("done");
     } catch (writeError) {
-      setError(writeError.message);
+      if (imported > 0) {
+        // Some chunks were already written. Drop them from the pending list
+        // so retrying doesn't create duplicates of those referrals.
+        setValidRows((rows) => rows.slice(imported));
+        setError(
+          `${writeError.message} (${imported.toLocaleString()} of ${total.toLocaleString()} rows were already imported; retrying will only import the remaining ${(total - imported).toLocaleString()}.)`,
+        );
+      } else {
+        setError(writeError.message);
+      }
       setStage("review");
     }
   }, [validRows, fileName]);
@@ -176,6 +202,10 @@ export default function AdminIntake() {
       setFinishing(false);
     }
   };
+
+  const percent = validRows.length
+    ? Math.min(100, Math.round((progress / validRows.length) * 100))
+    : 0;
 
   return (
     <div className="max-w-3xl">
@@ -302,16 +332,23 @@ export default function AdminIntake() {
 
       {stage === "importing" && (
         <div className="mt-6 rounded-md border border-slate-200 bg-white p-6">
-          <p className="text-sm text-slate-600">
-            Importing… {progress.toLocaleString()} /{" "}
-            {validRows.length.toLocaleString()}
-          </p>
-          <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-slate-100">
+          <div className="flex items-center justify-between text-sm text-slate-600">
+            <p>
+              Importing… {progress.toLocaleString()} /{" "}
+              {validRows.length.toLocaleString()}
+            </p>
+            <p className="font-medium text-slate-700">{percent}%</p>
+          </div>
+          <div
+            role="progressbar"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={percent}
+            className="mt-3 h-2 w-full overflow-hidden rounded-full bg-slate-100"
+          >
             <div
-              className="h-full rounded-full bg-[#2F6F62] transition-all"
-              style={{
-                width: `${validRows.length ? (progress / validRows.length) * 100 : 0}%`,
-              }}
+              className="h-full rounded-full bg-[#2F6F62] transition-all duration-300 ease-out"
+              style={{ width: `${percent}%` }}
             />
           </div>
         </div>

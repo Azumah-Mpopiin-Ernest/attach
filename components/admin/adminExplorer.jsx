@@ -10,6 +10,7 @@ import {
   Download,
   Trash2,
   Loader2,
+  AlertTriangle,
 } from "lucide-react";
 import StatusChip from "./statusChip";
 import ConfirmDialog from "./confirmDialog";
@@ -33,12 +34,23 @@ import { downloadAllReferralImagesZip } from "../../src/referralImages";
 const PAGE_SIZE = 25;
 const NOTICE_DURATION_MS = 4000;
 
+// Referrals in these statuses have a finished form the admin can download.
+const DOWNLOADABLE_STATUSES = ["READY_TO_ASSIGN", "ASSIGNED"];
+const isDownloadableReferral = (referral) =>
+  DOWNLOADABLE_STATUSES.includes(referral?.status);
+
+const TABS = [
+  { id: "referrals", label: "Referrals" },
+  { id: "downloads", label: "Downloads" },
+  { id: "delete", label: "Delete" },
+];
+
 const STATUS_OPTIONS = [
   { value: "", label: "All statuses" },
   { value: "AWAITING_SIGN", label: "Awaiting signature" },
   { value: "READY_TO_ASSIGN", label: "Ready to assign" },
   { value: "ASSIGNED", label: "Assigned" },
-  { value: "DONE", label: "Done" },
+  { value: "SKIPPED", label: "Skipped" },
 ];
 
 const ACTION_LABELS = {
@@ -69,6 +81,7 @@ const ACTION_LABELS = {
 // initialStatusFilter lets the Dashboard deep-link in with a status
 // pre-selected (see AdminDashboard's onNavigateToExplorer).
 export default function AdminExplorer({ initialStatusFilter = "" }) {
+  const [activeTab, setActiveTab] = useState("referrals");
   const [statusFilter, setStatusFilter] = useState(initialStatusFilter);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(null);
@@ -86,7 +99,7 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
   const [downloadingForms, setDownloadingForms] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(null); // { formsProcessed, totalForms }
 
-  // Export every referral as an individual PNG inside one ZIP.
+  // Export every downloadable referral as an individual PNG inside one ZIP.
   const [exportingImages, setExportingImages] = useState(false);
   const [imageProgress, setImageProgress] = useState(null); // { phase, done, total, failed }
   const exportAbort = useRef(null);
@@ -143,7 +156,8 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
     };
   }, []);
 
-  // Cancel a running image export if the admin navigates away.
+  // Cancel a running image export if the admin leaves the Explorer entirely.
+  // (Switching between the Explorer's own tabs keeps the export running.)
   useEffect(() => {
     return () => exportAbort.current?.abort();
   }, []);
@@ -180,6 +194,11 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
       return true;
     });
   }, [referrals, statusFilter, query]);
+
+  const downloadableCount = useMemo(
+    () => referrals.filter(isDownloadableReferral).length,
+    [referrals],
+  );
 
   // Selection spans pages (that's the point of selecting a whole date), but
   // must never include rows the current search has filtered out.
@@ -283,22 +302,23 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
     });
   };
 
-  const downloadAllReadyForms = async () => {
+  const downloadAllForms = async () => {
     setDownloadingForms(true);
     setDownloadProgress(null);
     try {
       const currentReferrals = await getReferrals({ force: true });
-      const readyReferrals = currentReferrals.filter(
-        (referral) => referral.status === "READY_TO_ASSIGN",
-      );
+      const downloadable = currentReferrals.filter(isDownloadableReferral);
+      if (downloadable.length === 0) {
+        throw new Error("No ready or assigned referrals to download.");
+      }
       const sheetCount = await downloadReadyToAssignFormsZip(
-        readyReferrals,
+        downloadable,
         undefined,
         setDownloadProgress,
       );
       showNotice(
         "success",
-        `Downloaded ${sheetCount} print sheet${sheetCount === 1 ? "" : "s"} (${readyReferrals.length} form${readyReferrals.length === 1 ? "" : "s"}).`,
+        `Downloaded ${sheetCount} print sheet${sheetCount === 1 ? "" : "s"} (${downloadable.length} form${downloadable.length === 1 ? "" : "s"}).`,
       );
     } catch (downloadError) {
       showNotice("error", downloadError.message);
@@ -323,13 +343,11 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
     downloadAllReferralImagesZip({
       loadReferrals: async () => {
         const current = await getReferrals({ force: true });
-        const ready = current.filter(
-          (referral) => referral.status === "READY_TO_ASSIGN",
-        );
-        if (ready.length === 0) {
-          throw new Error("No referrals are ready to assign.");
+        const downloadable = current.filter(isDownloadableReferral);
+        if (downloadable.length === 0) {
+          throw new Error("No ready or assigned referrals to export.");
         }
-        return ready;
+        return downloadable;
       },
       signal: controller.signal,
       onProgress: setImageProgress,
@@ -485,10 +503,42 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
       .catch((writeError) => showNotice("error", writeError.message));
   };
 
+  const busy = downloadingForms || exportingImages || deleting;
+
   return (
     <div>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-xl font-semibold text-slate-900">Explorer</h1>
+      </div>
+
+      {/* Explorer sub-tabs */}
+      <div
+        role="tablist"
+        aria-label="Explorer sections"
+        className="mt-4 flex gap-1 border-b border-slate-200"
+      >
+        {TABS.map((tab) => {
+          const isActive = activeTab === tab.id;
+          const isDelete = tab.id === "delete";
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={isActive}
+              onClick={() => setActiveTab(tab.id)}
+              className={`-mb-px border-b-2 px-4 py-2 text-sm font-medium transition ${
+                isActive
+                  ? isDelete
+                    ? "border-rose-600 text-rose-700"
+                    : "border-[#2F6F62] text-[#2F6F62]"
+                  : "border-transparent text-slate-500 hover:text-slate-700"
+              }`}
+            >
+              {tab.label}
+            </button>
+          );
+        })}
       </div>
 
       {notice && (
@@ -506,307 +556,376 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
         </div>
       )}
 
-      <div className="mt-4 flex flex-wrap items-center gap-3">
-        <select
-          value={statusFilter}
-          onChange={(e) => setStatusFilter(e.target.value)}
-          className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-700 focus:border-[#2F6F62] focus:outline-none"
-        >
-          {STATUS_OPTIONS.map((opt) => (
-            <option key={opt.value} value={opt.value}>
-              {opt.label}
-            </option>
-          ))}
-        </select>
-
-        <div className="relative w-full sm:w-auto">
-          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search name, patient ID, or NHIS"
-            className="w-full rounded-md border border-slate-300 py-1.5 pl-8 pr-3 text-sm focus:border-[#2F6F62] focus:outline-none sm:w-72"
-          />
-        </div>
-
-        <button
-          type="button"
-          onClick={downloadAllReadyForms}
-          disabled={downloadingForms || exportingImages || deleting}
-          className="flex items-center justify-center gap-2 cursor-pointer border border-black hover:bg-[#2F6F62] transition p-2 rounded-xl disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          <Download className="h-4 w-4" />
-          {downloadingForms
-            ? downloadProgress
-              ? `Preparing ${downloadProgress.formsProcessed}/${downloadProgress.totalForms}...`
-              : "Preparing PDFs..."
-            : "Print Forms"}
-        </button>
-
-        <button
-          type="button"
-          onClick={
-            exportingImages
-              ? () => exportAbort.current?.abort()
-              : downloadAllImages
-          }
-          disabled={downloadingForms || deleting}
-          className="flex items-center justify-center gap-2 cursor-pointer border border-black hover:bg-[#2F6F62] transition p-2 rounded-xl disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          <Download className="h-4 w-4" />
-          {exportingImages
-            ? imageProgress?.phase === "rendering"
-              ? `Rendering ${imageProgress.done}/${imageProgress.total} · Cancel`
-              : "Preparing… · Cancel"
-            : "Export ready forms"}
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setDeleteOpen(true)}
-          disabled={
-            exportingImages ||
-            downloadingForms ||
-            deleting ||
-            referrals.length === 0
-          }
-          className="flex items-center justify-center gap-2 rounded-xl border border-rose-300 p-2 text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40"
-        >
-          <Trash2 className="h-4 w-4" />
-          Delete all referrals
-        </button>
-
-        {assignmentModeActive && (
-          <div className="flex w-full flex-wrap items-center gap-2 text-sm text-slate-600 sm:ml-auto sm:w-auto sm:flex-nowrap">
-            <span>{selectedIds.length} selected</span>
-            <button
-              type="button"
-              onClick={toggleAllAssignable}
-              disabled={assigning || allAssignableIds.length === 0}
-              className="rounded-md border border-slate-300 px-3 py-1.5 text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {selectedIds.length > 0 &&
-              allAssignableIds.every((id) => selectedIds.includes(id))
-                ? "Clear selection"
-                : `Select all assignable (${allAssignableIds.length})`}
-            </button>
+      {/* ───────────── Referrals tab ───────────── */}
+      {activeTab === "referrals" && (
+        <>
+          <div className="mt-4 flex flex-wrap items-center gap-3">
             <select
-              ref={assignSelectRef}
-              disabled={
-                !selectedIds.length ||
-                assigning ||
-                Boolean(pendingAssignment) ||
-                selectedIds.some(
-                  (id) =>
-                    !isAssignableReferral(
-                      referrals.find((referral) => referral.id === id),
-                    ),
-                )
-              }
-              defaultValue=""
-              onChange={handleAssignSelectChange}
-              aria-label="Assign selected referrals to an officer"
-              className="min-w-0 flex-1 rounded-md border border-slate-300 px-3 py-1.5 disabled:opacity-50 sm:flex-none"
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-700 focus:border-[#2F6F62] focus:outline-none"
             >
-              <option value="">Assign selected to...</option>
-              {officers.map((officer) => (
-                <option
-                  key={officer.id}
-                  value={
-                    officer.fullName ?? officer.name ?? officer.displayName
-                  }
-                >
-                  {officer.fullName ??
-                    officer.name ??
-                    officer.displayName ??
-                    officer.id}
+              {STATUS_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
                 </option>
               ))}
             </select>
-            {assigning && (
-              <span className="flex items-center gap-1.5 text-xs text-slate-500">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                Assigning...
-              </span>
+
+            <div className="relative w-full sm:w-auto">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search name, patient ID, or NHIS"
+                className="w-full rounded-md border border-slate-300 py-1.5 pl-8 pr-3 text-sm focus:border-[#2F6F62] focus:outline-none sm:w-72"
+              />
+            </div>
+
+            {assignmentModeActive && (
+              <div className="flex w-full flex-wrap items-center gap-2 text-sm text-slate-600 sm:ml-auto sm:w-auto sm:flex-nowrap">
+                <span>{selectedIds.length} selected</span>
+                <button
+                  type="button"
+                  onClick={toggleAllAssignable}
+                  disabled={assigning || allAssignableIds.length === 0}
+                  className="rounded-md border border-slate-300 px-3 py-1.5 text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {selectedIds.length > 0 &&
+                  allAssignableIds.every((id) => selectedIds.includes(id))
+                    ? "Clear selection"
+                    : `Select all assignable (${allAssignableIds.length})`}
+                </button>
+                <select
+                  ref={assignSelectRef}
+                  disabled={
+                    !selectedIds.length ||
+                    assigning ||
+                    Boolean(pendingAssignment) ||
+                    selectedIds.some(
+                      (id) =>
+                        !isAssignableReferral(
+                          referrals.find((referral) => referral.id === id),
+                        ),
+                    )
+                  }
+                  defaultValue=""
+                  onChange={handleAssignSelectChange}
+                  aria-label="Assign selected referrals to an officer"
+                  className="min-w-0 flex-1 rounded-md border border-slate-300 px-3 py-1.5 disabled:opacity-50 sm:flex-none"
+                >
+                  <option value="">Assign selected to...</option>
+                  {officers.map((officer) => (
+                    <option
+                      key={officer.id}
+                      value={
+                        officer.fullName ?? officer.name ?? officer.displayName
+                      }
+                    >
+                      {officer.fullName ??
+                        officer.name ??
+                        officer.displayName ??
+                        officer.id}
+                    </option>
+                  ))}
+                </select>
+                {assigning && (
+                  <span className="flex items-center gap-1.5 text-xs text-slate-500">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    Assigning...
+                  </span>
+                )}
+              </div>
             )}
           </div>
-        )}
-      </div>
 
-      {assignmentModeActive ? (
-        <p className="mt-3 text-xs text-slate-400">
-          Grouped by the date on the form. Tick a date's checkbox to select
-          every assignable referral in it (including ones on other pages), then
-          assign the whole group to one officer in one go. Your selection is
-          kept as you move between pages.
-        </p>
-      ) : null}
+          {assignmentModeActive ? (
+            <p className="mt-3 text-xs text-slate-400">
+              Grouped by the date on the form. Tick a date's checkbox to select
+              every assignable referral in it (including ones on other pages),
+              then assign the whole group to one officer in one go. Your
+              selection is kept as you move between pages.
+            </p>
+          ) : null}
 
-      <div className="mt-5 overflow-x-auto rounded-md border border-slate-200 bg-white">
-        {loading && (
-          <table className="w-full text-sm">
-            <tbody>
-              {Array.from({ length: 5 }, (_, index) => (
-                <tr
-                  key={`loading-${index}`}
-                  className="border-b border-slate-100"
-                >
-                  <td colSpan={columnCount} className="px-5 py-4">
-                    <div className="h-4 w-full animate-pulse rounded bg-slate-100" />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-
-        {!loading && assignmentModeActive && (
-          <>
-            {groupedByDate.length === 0 && (
-              <p className="px-5 py-10 text-center text-slate-400">
-                No referrals match these filters.
-              </p>
-            )}
-            {assignmentPageGroups.map((group) => {
-              const allSelected =
-                group.assignableIds.length > 0 &&
-                group.assignableIds.every((id) => selectedIds.includes(id));
-              const isCollapsed = collapsedDates.has(group.key);
-              const total = group.referrals.length;
-              const onThisPage = group.pageReferrals.length;
-              return (
-                <div
-                  key={group.key}
-                  className="border-b border-slate-200 last:border-0"
-                >
-                  <div className="flex items-center gap-3 bg-slate-50 px-5 py-2.5">
-                    <input
-                      type="checkbox"
-                      aria-label={`Select all referrals for ${group.label}`}
-                      disabled={!group.assignableIds.length}
-                      checked={allSelected}
-                      onChange={() => toggleDateGroupSelected(group)}
-                      className="disabled:opacity-40"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => toggleCollapsed(group.key)}
-                      className="flex flex-1 items-center justify-between gap-3 text-left"
+          <div className="mt-5 overflow-x-auto rounded-md border border-slate-200 bg-white">
+            {loading && (
+              <table className="w-full text-sm">
+                <tbody>
+                  {Array.from({ length: 5 }, (_, index) => (
+                    <tr
+                      key={`loading-${index}`}
+                      className="border-b border-slate-100"
                     >
-                      <span className="flex items-center gap-1.5 text-sm font-medium text-slate-700">
-                        {isCollapsed ? (
-                          <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
-                        ) : (
-                          <ChevronDown className="h-3.5 w-3.5 text-slate-400" />
-                        )}
-                        {group.label}
-                      </span>
-                      <span className="text-xs text-slate-400">
-                        {onThisPage === total
-                          ? `${total} referral${total === 1 ? "" : "s"}`
-                          : `${onThisPage} of ${total} referrals on this page`}
-                        {group.assignableIds.length
-                          ? ` · ${group.assignableIds.length} assignable`
-                          : " · none signed by both doctors yet"}
-                      </span>
-                    </button>
-                  </div>
+                      <td colSpan={columnCount} className="px-5 py-4">
+                        <div className="h-4 w-full animate-pulse rounded bg-slate-100" />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
 
-                  {!isCollapsed && (
-                    <table className="w-full text-sm">
-                      <tbody>
-                        {group.pageReferrals.map((r) => (
-                          <tr
-                            key={r.id}
-                            onClick={() => setSelected(r)}
-                            className="cursor-pointer border-b border-slate-100 last:border-0 hover:bg-slate-50"
-                          >
-                            <td className="w-10 px-5 py-3">
-                              <input
-                                type="checkbox"
-                                aria-label={`Select ${r.name ?? r.patientName ?? r.patientId}`}
-                                disabled={!isAssignableReferral(r)}
-                                checked={selectedIds.includes(r.id)}
-                                onChange={() => toggleSelected(r.id)}
-                                onClick={(event) => event.stopPropagation()}
-                              />
-                            </td>
-                            <td className="px-5 py-3">
-                              <div className="font-medium text-slate-800">
-                                {r.name ?? r.patientName}
-                              </div>
-                              <div className="font-mono text-xs text-slate-400">
-                                {r.patientId}
-                              </div>
-                            </td>
-                            <td className="px-5 py-3">
-                              <StatusChip
-                                status={r.status}
-                                officerName={r.assignedTo}
-                              />
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  )}
-                </div>
-              );
-            })}
-          </>
-        )}
-
-        {!loading && !assignmentModeActive && (
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-slate-200 bg-slate-50 text-left text-xs text-slate-500">
-                <th className="px-5 py-3 font-medium">Patient</th>
-                <th className="px-5 py-3 font-medium">Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {paginated.map((r) => (
-                <tr
-                  key={r.id}
-                  onClick={() => setSelected(r)}
-                  className="cursor-pointer border-b border-slate-100 last:border-0 hover:bg-slate-50"
-                >
-                  <td className="px-5 py-3">
-                    <div className="font-medium text-slate-800">
-                      {r.name ?? r.patientName}
-                    </div>
-                    <div className="font-mono text-xs text-slate-400">
-                      {r.patientId}
-                    </div>
-                  </td>
-                  <td className="px-5 py-3">
-                    <StatusChip status={r.status} officerName={r.assignedTo} />
-                  </td>
-                </tr>
-              ))}
-              {filtered.length === 0 && (
-                <tr>
-                  <td
-                    colSpan={columnCount}
-                    className="px-5 py-10 text-center text-slate-400"
-                  >
+            {!loading && assignmentModeActive && (
+              <>
+                {groupedByDate.length === 0 && (
+                  <p className="px-5 py-10 text-center text-slate-400">
                     No referrals match these filters.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        )}
+                  </p>
+                )}
+                {assignmentPageGroups.map((group) => {
+                  const allSelected =
+                    group.assignableIds.length > 0 &&
+                    group.assignableIds.every((id) => selectedIds.includes(id));
+                  const isCollapsed = collapsedDates.has(group.key);
+                  const total = group.referrals.length;
+                  const onThisPage = group.pageReferrals.length;
+                  return (
+                    <div
+                      key={group.key}
+                      className="border-b border-slate-200 last:border-0"
+                    >
+                      <div className="flex items-center gap-3 bg-slate-50 px-5 py-2.5">
+                        <input
+                          type="checkbox"
+                          aria-label={`Select all referrals for ${group.label}`}
+                          disabled={!group.assignableIds.length}
+                          checked={allSelected}
+                          onChange={() => toggleDateGroupSelected(group)}
+                          className="disabled:opacity-40"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => toggleCollapsed(group.key)}
+                          className="flex flex-1 items-center justify-between gap-3 text-left"
+                        >
+                          <span className="flex items-center gap-1.5 text-sm font-medium text-slate-700">
+                            {isCollapsed ? (
+                              <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
+                            ) : (
+                              <ChevronDown className="h-3.5 w-3.5 text-slate-400" />
+                            )}
+                            {group.label}
+                          </span>
+                          <span className="text-xs text-slate-400">
+                            {onThisPage === total
+                              ? `${total} referral${total === 1 ? "" : "s"}`
+                              : `${onThisPage} of ${total} referrals on this page`}
+                            {group.assignableIds.length
+                              ? ` · ${group.assignableIds.length} assignable`
+                              : " · none signed by both doctors yet"}
+                          </span>
+                        </button>
+                      </div>
 
-        {!loading && (
-          <Pagination
-            page={currentPage}
-            pageCount={pageCount}
-            onPageChange={setPage}
-            total={filtered.length}
-          />
-        )}
-      </div>
+                      {!isCollapsed && (
+                        <table className="w-full text-sm">
+                          <tbody>
+                            {group.pageReferrals.map((r) => (
+                              <tr
+                                key={r.id}
+                                onClick={() => setSelected(r)}
+                                className="cursor-pointer border-b border-slate-100 last:border-0 hover:bg-slate-50"
+                              >
+                                <td className="w-10 px-5 py-3">
+                                  <input
+                                    type="checkbox"
+                                    aria-label={`Select ${r.name ?? r.patientName ?? r.patientId}`}
+                                    disabled={!isAssignableReferral(r)}
+                                    checked={selectedIds.includes(r.id)}
+                                    onChange={() => toggleSelected(r.id)}
+                                    onClick={(event) => event.stopPropagation()}
+                                  />
+                                </td>
+                                <td className="px-5 py-3">
+                                  <div className="font-medium text-slate-800">
+                                    {r.name ?? r.patientName}
+                                  </div>
+                                  <div className="font-mono text-xs text-slate-400">
+                                    {r.patientId}
+                                  </div>
+                                </td>
+                                <td className="px-5 py-3">
+                                  <StatusChip
+                                    status={r.status}
+                                    officerName={r.assignedTo}
+                                  />
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      )}
+                    </div>
+                  );
+                })}
+              </>
+            )}
+
+            {!loading && !assignmentModeActive && (
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50 text-left text-xs text-slate-500">
+                    <th className="px-5 py-3 font-medium">Patient</th>
+                    <th className="px-5 py-3 font-medium">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {paginated.map((r) => (
+                    <tr
+                      key={r.id}
+                      onClick={() => setSelected(r)}
+                      className="cursor-pointer border-b border-slate-100 last:border-0 hover:bg-slate-50"
+                    >
+                      <td className="px-5 py-3">
+                        <div className="font-medium text-slate-800">
+                          {r.name ?? r.patientName}
+                        </div>
+                        <div className="font-mono text-xs text-slate-400">
+                          {r.patientId}
+                        </div>
+                      </td>
+                      <td className="px-5 py-3">
+                        <StatusChip
+                          status={chipStatus(r.status)}
+                          officerName={r.assignedTo}
+                        />
+                      </td>
+                    </tr>
+                  ))}
+                  {filtered.length === 0 && (
+                    <tr>
+                      <td
+                        colSpan={columnCount}
+                        className="px-5 py-10 text-center text-slate-400"
+                      >
+                        No referrals match these filters.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            )}
+
+            {!loading && (
+              <Pagination
+                page={currentPage}
+                pageCount={pageCount}
+                onPageChange={setPage}
+                total={filtered.length}
+              />
+            )}
+          </div>
+        </>
+      )}
+
+      {/* ───────────── Downloads tab ───────────── */}
+      {activeTab === "downloads" && (
+        <div className="mt-5 max-w-2xl space-y-4">
+          <p className="text-sm text-slate-600">
+            Downloads include every referral that is{" "}
+            <span className="font-medium">Ready to assign</span> or{" "}
+            <span className="font-medium">Assigned</span>
+            {loading ? "." : ` (${downloadableCount} right now).`}
+          </p>
+
+          <div className="rounded-md border border-slate-200 bg-white p-4">
+            <h2 className="text-sm font-semibold text-slate-900">
+              Print sheets
+            </h2>
+            <p className="mt-1 text-sm text-slate-500">
+              A ZIP of print-ready sheets containing the referral forms.
+            </p>
+            <button
+              type="button"
+              onClick={downloadAllForms}
+              disabled={busy || loading || downloadableCount === 0}
+              className="mt-3 flex items-center justify-center gap-2 cursor-pointer border border-black hover:bg-[#2F6F62] transition p-2 rounded-xl disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Download className="h-4 w-4" />
+              {downloadingForms
+                ? downloadProgress
+                  ? `Preparing ${downloadProgress.formsProcessed}/${downloadProgress.totalForms}...`
+                  : "Preparing PDFs..."
+                : "Print Forms"}
+            </button>
+          </div>
+
+          <div className="rounded-md border border-slate-200 bg-white p-4">
+            <h2 className="text-sm font-semibold text-slate-900">
+              Form images
+            </h2>
+            <p className="mt-1 text-sm text-slate-500">
+              Each referral exported as an individual PNG inside a ZIP, the same
+              images officers download.
+            </p>
+            <button
+              type="button"
+              onClick={
+                exportingImages
+                  ? () => exportAbort.current?.abort()
+                  : downloadAllImages
+              }
+              disabled={
+                downloadingForms ||
+                deleting ||
+                (!exportingImages && (loading || downloadableCount === 0))
+              }
+              className="mt-3 flex items-center justify-center gap-2 cursor-pointer border border-black hover:bg-[#2F6F62] transition p-2 rounded-xl disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Download className="h-4 w-4" />
+              {exportingImages
+                ? imageProgress?.phase === "rendering"
+                  ? `Rendering ${imageProgress.done}/${imageProgress.total} · Cancel`
+                  : "Preparing… · Cancel"
+                : "Download all forms"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ───────────── Delete tab ───────────── */}
+      {activeTab === "delete" && (
+        <div className="mt-5 max-w-2xl rounded-md border border-rose-200 bg-rose-50/40 p-5">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-rose-600" />
+            <div>
+              <h2 className="text-sm font-semibold text-rose-800">
+                Delete all referrals
+              </h2>
+              <p className="mt-1 text-sm text-slate-600">
+                This permanently removes every referral in the system, including
+                assigned ones. It cannot be undone. Use the Downloads tab to
+                save a copy first if you need one.
+              </p>
+              <div className="mt-4 flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setActiveTab("downloads")}
+                  className="rounded-xl border border-slate-300 bg-white p-2 text-sm text-slate-700 hover:bg-slate-50"
+                >
+                  Go to Downloads
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDeleteOpen(true)}
+                  disabled={busy || referrals.length === 0}
+                  className="flex items-center justify-center gap-2 rounded-xl border border-rose-300 bg-white p-2 text-sm text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  Delete all referrals
+                </button>
+              </div>
+              {(downloadingForms || exportingImages) && (
+                <p className="mt-3 text-xs text-slate-500">
+                  A download is still running. Wait for it to finish before
+                  deleting.
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Detail drawer */}
       {selected && (
@@ -833,7 +952,7 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
 
             <div className="flex-1 overflow-y-auto px-6 py-5">
               <StatusChip
-                status={selected.status}
+                status={chipStatus(selected.status)}
                 officerName={selected.assignedTo}
               />
 
@@ -1007,6 +1126,14 @@ function formatDate(value) {
   if (!value) return "—";
   const date = value.toDate ? value.toDate() : new Date(value);
   return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString();
+}
+
+// A skipped referral is still held by an officer, so it shows as Assigned
+// (with the officer's name) in the status column. StatusChip doesn't know
+// the SKIPPED value and was falling back to "Awaiting signature". The real
+// status is untouched; this only changes what the chip displays.
+function chipStatus(status) {
+  return status === "SKIPPED" ? "ASSIGNED" : status;
 }
 
 function isAssignableReferral(referral) {

@@ -1,5 +1,11 @@
 import { AlertTriangle } from "lucide-react";
 
+const CONFIRM_CLASSES = {
+  default: "bg-[#2F6F62] hover:bg-[#265a50] focus-visible:outline-[#2F6F62]",
+  danger: "bg-rose-700 hover:bg-rose-800 focus-visible:outline-rose-700",
+  warning: "bg-yellow-600 hover:bg-yellow-700 focus-visible:outline-yellow-600",
+};
+
 // Every override action must name its exact consequence — never a generic
 // "Are you sure?" (see UX section 6.5 / global patterns).
 export default function ConfirmDialog({
@@ -13,10 +19,7 @@ export default function ConfirmDialog({
 }) {
   if (!open) return null;
 
-  const confirmClasses =
-    tone === "danger"
-      ? "bg-rose-700 hover:bg-rose-800 focus-visible:outline-rose-700"
-      : "bg-[#2F6F62] hover:bg-[#265a50] focus-visible:outline-[#2F6F62]";
+  const confirmClasses = CONFIRM_CLASSES[tone] ?? CONFIRM_CLASSES.default;
 
   return (
     <div
