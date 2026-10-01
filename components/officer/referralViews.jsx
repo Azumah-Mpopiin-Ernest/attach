@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Check, CheckCircle2, Copy, Download, SkipForward } from "lucide-react";
 import { formatDateLabel, getDateKey } from "../../src/referralDates";
 import { referralName, useReferralActions } from "./referralFlow";
-
+import { useLhimsAutomation } from "../../src/lhims/useLhimsAutomation";
 const BUTTON_BASE =
   "inline-flex items-center justify-center gap-1.5 rounded-md border font-medium transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400 disabled:cursor-not-allowed";
 const SIZE_CLASSES = {
@@ -177,10 +177,103 @@ function unlockHint({ actions, ready, secondsLeft }) {
   return "Attached it in LHIMS? Mark Done. Couldn't attach it because of a problem with the patient's folder? Skip.";
 }
 
-/**
- * The single referral the officer is working on. Mount with
- * `key={referral.id}` so the safeguards are per patient.
- */
+const STAGE_TEXT = {
+  IDLE: "Waiting for the extension…",
+  JOB_RECEIVED:
+    "Ready. In LHIMS, open the patient-list tab you want to use and press “Use this tab for the current referral”.",
+  TAB_CLAIMED: "Starting in LHIMS…",
+  SEARCHING: "Searching for the patient in LHIMS…",
+  MATCHED: "Patient found. Opening the attachment page…",
+  ON_ATTACHMENT_PAGE: "Checking the visit…",
+  FILE_ATTACHED: "File attached. Filling the note…",
+  NOTE_FILLED: "Note filled. Setting the type…",
+  TYPE_SET: "Final check…",
+  READY_FOR_SAVE: "Check the LHIMS page, then click Save there.",
+  SAVE_CLICKED: "Save clicked. Confirming…",
+  VERIFIED: "Verified in LHIMS. You can mark this done.",
+  MISMATCH: "Wrong patient detected. Do not save. Nothing was attached.",
+  UNVERIFIED:
+    "The save couldn't be confirmed. Check the attachment in LHIMS before marking done.",
+  LOGGED_OUT: "LHIMS is logged out. Log in, then retry.",
+  EXTENSION_ERROR: "The extension hit an error. Continue manually.",
+};
+const REASON_TEXT = {
+  NO_MATCH:
+    "No exact match for this patient in the open patient list. Skip this referral.",
+  MULTIPLE_MATCHES: "More than one match for this patient. Skip this referral.",
+  TIMEOUT: "LHIMS took too long. Finish manually, retry, or skip.",
+  TAB_CLOSED: "The LHIMS tab was closed. Retry.",
+  FORM_RENDER_FAILED:
+    "The form couldn't be prepared (signatures may not be saved on this device). Use Download Form below.",
+  BREAKER_TRIPPED:
+    "Assist is paused after repeated problems. Acknowledge to resume.",
+};
+
+function LhimsAssistPanel({ lhims }) {
+  const { stage, problem, reason, warn, breakerTripped, manuallyConfirmed } =
+    lhims;
+  const bad =
+    Boolean(problem) || stage === "MISMATCH" || stage === "UNVERIFIED";
+  const tone =
+    stage === "VERIFIED"
+      ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+      : bad
+        ? "border-rose-200 bg-rose-50 text-rose-900"
+        : "border-sky-200 bg-sky-50 text-sky-900";
+  const text =
+    REASON_TEXT[problem?.code] ??
+    (stage === "NEEDS_ATTENTION"
+      ? (REASON_TEXT[reason] ?? `Could not continue (${reason}).`)
+      : STAGE_TEXT[stage]);
+  const canRetry =
+    ["NEEDS_ATTENTION", "LOGGED_OUT", "EXTENSION_ERROR"].includes(stage) &&
+    !breakerTripped;
+
+  return (
+    <div
+      role="status"
+      className={`mt-5 rounded-md border px-4 py-3 text-sm ${tone}`}
+    >
+      <p className="font-medium">LHIMS Assist</p>
+      <p className="mt-0.5">{text}</p>
+      {warn && <p className="mt-1 text-xs">Note: {warn}</p>}
+      <div className="mt-2 flex flex-wrap gap-2">
+        {breakerTripped && (
+          <button
+            type="button"
+            onClick={lhims.ackBreaker}
+            className={`${BUTTON_BASE} ${SIZE_CLASSES.sm} border-slate-300 bg-white text-slate-700 hover:bg-slate-50`}
+          >
+            Acknowledge and resume
+          </button>
+        )}
+        {canRetry && (
+          <button
+            type="button"
+            onClick={lhims.startJob}
+            className={`${BUTTON_BASE} ${SIZE_CLASSES.sm} border-slate-300 bg-white text-slate-700 hover:bg-slate-50`}
+          >
+            Retry
+          </button>
+        )}
+        {stage === "UNVERIFIED" && !manuallyConfirmed && (
+          <button
+            type="button"
+            onClick={() =>
+              window.confirm(
+                "Have you confirmed in LHIMS that the file is attached to the right patient?",
+              ) && lhims.confirmManually()
+            }
+            className={`${BUTTON_BASE} ${SIZE_CLASSES.sm} border-slate-300 bg-white text-slate-700 hover:bg-slate-50`}
+          >
+            I checked LHIMS
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function ActiveReferralCard({
   referral,
   formsFolder,
@@ -189,8 +282,18 @@ export function ActiveReferralCard({
   onError,
 }) {
   const flow = useReferralActions(referral, onError, formsFolder);
+  const lhims = useLhimsAutomation(referral);
   const { actions, downloading, unlocked, secondsLeft, copyId, download } =
     flow;
+
+  const viaExtension = lhims.extensionPresent;
+  // Extension present: Mark Done needs VERIFIED (or the officer's manual confirmation).
+  // Extension absent: the existing copy + download + countdown guard.
+  const canMarkDone = viaExtension
+    ? lhims.verified || lhims.manuallyConfirmed
+    : unlocked;
+  // Skip keeps the countdown guard, and is also allowed on NEEDS_ATTENTION.
+  const canSkip = unlocked || lhims.stage === "NEEDS_ATTENTION";
 
   return (
     <article
@@ -227,39 +330,56 @@ export function ActiveReferralCard({
           </div>
         </dl>
 
-        <AttachmentNote onError={onError} />
+        {viaExtension && <LhimsAssistPanel lhims={lhims} />}
 
-        <div className="mt-6 flex flex-wrap gap-3">
-          <CopyIdButton size="lg" done={actions.idCopied} onClick={copyId} />
-          <DownloadFormButton
-            size="lg"
-            done={actions.fileDownloaded}
-            downloading={downloading}
-            onClick={download}
-          />
+        {!viaExtension && <AttachmentNote onError={onError} />}
+
+        <div className="mt-6">
+          {viaExtension && (
+            <p className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-400">
+              Manual fallback
+            </p>
+          )}
+          <div className="flex flex-wrap gap-3">
+            <CopyIdButton size="lg" done={actions.idCopied} onClick={copyId} />
+            <DownloadFormButton
+              size="lg"
+              done={actions.fileDownloaded}
+              downloading={downloading}
+              onClick={download}
+            />
+          </div>
         </div>
 
-        <p className="mt-3 text-sm text-slate-500">
-          {formsFolder.hasFolder
-            ? `After Download Form, the form is in your "${formsFolder.folderName}" folder. In LHIMS, click Attach and pick the only file there, or drag it in from that folder.`
-            : "After Download Form, drag the file from your browser's downloads list straight into LHIMS."}
-        </p>
+        {(!viaExtension || actions.fileDownloaded) && (
+          <p className="mt-3 text-sm text-slate-500">
+            {formsFolder.hasFolder
+              ? `After Download Form, the form is in your "${formsFolder.folderName}" folder. In LHIMS, click Attach and pick the only file there, or drag it in from that folder.`
+              : "After Download Form, drag the file from your browser's downloads list straight into LHIMS."}
+          </p>
+        )}
 
         <div className="mt-6 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-5">
           <SkipButton
-            unlocked={unlocked}
-            secondsLeft={secondsLeft}
+            unlocked={canSkip}
+            secondsLeft={canSkip ? 0 : secondsLeft}
             onClick={() => onRequestSkip(referral)}
           />
           <MarkDoneButton
             size="lg"
-            unlocked={unlocked}
-            secondsLeft={secondsLeft}
+            unlocked={canMarkDone}
+            secondsLeft={viaExtension ? 0 : secondsLeft}
             onClick={() => onRequestDone(referral)}
           />
         </div>
 
-        <p className="mt-3 text-sm text-slate-500">{unlockHint(flow)}</p>
+        <p className="mt-3 text-sm text-slate-500">
+          {viaExtension
+            ? lhims.verified
+              ? "Verified in LHIMS. Mark Done."
+              : "Mark Done unlocks once LHIMS Assist verifies the attachment. Can't attach it? Skip."
+            : unlockHint(flow)}
+        </p>
       </div>
     </article>
   );
