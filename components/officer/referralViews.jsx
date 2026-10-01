@@ -3,6 +3,7 @@ import { Check, CheckCircle2, Copy, Download, SkipForward } from "lucide-react";
 import { formatDateLabel, getDateKey } from "../../src/referralDates";
 import { referralName, useReferralActions } from "./referralFlow";
 import { useLhimsAutomation } from "../../src/lhims/useLhimsAutomation";
+
 const BUTTON_BASE =
   "inline-flex items-center justify-center gap-1.5 rounded-md border font-medium transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400 disabled:cursor-not-allowed";
 const SIZE_CLASSES = {
@@ -177,10 +178,14 @@ function unlockHint({ actions, ready, secondsLeft }) {
   return "Attached it in LHIMS? Mark Done. Couldn't attach it because of a problem with the patient's folder? Skip.";
 }
 
+// ---------------------------------------------------------------------------
+// LHIMS Assist (browser extension) panel
+// ---------------------------------------------------------------------------
+
 const STAGE_TEXT = {
   IDLE: "Waiting for the extension…",
   JOB_RECEIVED:
-    "Ready. In LHIMS, open the patient-list tab you want to use and press “Use this tab for the current referral”.",
+    "Ready. In LHIMS, open the patient-list tab you want to use and press “Use this tab for the current referral”, or start the auto run from the Filter Selection page.",
   TAB_CLAIMED: "Starting in LHIMS…",
   SEARCHING: "Searching for the patient in LHIMS…",
   MATCHED: "Patient found. Opening the attachment page…",
@@ -197,37 +202,82 @@ const STAGE_TEXT = {
   LOGGED_OUT: "LHIMS is logged out. Log in, then retry.",
   EXTENSION_ERROR: "The extension hit an error. Continue manually.",
 };
+
+// Wording that differs while the auto run is driving this referral.
+const AUTO_TEXT = {
+  READY_FOR_SAVE: "Saving in LHIMS…",
+  VERIFIED: "Verified in LHIMS. Marking it done…",
+  JOB_RECEIVED: "Waiting for a ready LHIMS tab…",
+};
+
 const REASON_TEXT = {
   NO_MATCH:
     "No exact match for this patient in the open patient list. Skip this referral.",
   MULTIPLE_MATCHES: "More than one match for this patient. Skip this referral.",
+  NO_USABLE_ROW:
+    "Every matching visit is green or red. Skip this referral or handle it manually.",
   TIMEOUT: "LHIMS took too long. Finish manually, retry, or skip.",
   TAB_CLOSED: "The LHIMS tab was closed. Retry.",
+  ALREADY_ATTACHED:
+    "This visit already shows the referral note. Check LHIMS: if it is the right file, confirm below, otherwise skip.",
+  NAME_NOT_VERIFIABLE:
+    "The patient name could not be read in LHIMS. Check this referral.",
+  UNEXPECTED_DIALOG:
+    "LHIMS showed a message the extension did not expect. Look at the LHIMS page.",
+  NO_BASELINE:
+    "The save could not be made verifiable, so nothing was saved. Check this referral.",
   FORM_RENDER_FAILED:
     "The form couldn't be prepared (signatures may not be saved on this device). Use Download Form below.",
   BREAKER_TRIPPED:
     "Assist is paused after repeated problems. Acknowledge to resume.",
 };
 
+const REASON_SUFFIX_STAGES = new Set([
+  "MISMATCH",
+  "UNVERIFIED",
+  "EXTENSION_ERROR",
+]);
+
+function lhimsText({ stage, problem, reason, runActive, auto }) {
+  if (runActive && stage === "JOB_RECEIVED") return AUTO_TEXT.JOB_RECEIVED;
+  if (problem?.code && REASON_TEXT[problem.code])
+    return REASON_TEXT[problem.code];
+  if (stage === "NEEDS_ATTENTION") return `Could not continue (${reason}).`;
+  if (auto && AUTO_TEXT[stage]) return AUTO_TEXT[stage];
+  const base = STAGE_TEXT[stage] ?? stage;
+  return REASON_SUFFIX_STAGES.has(stage) && reason
+    ? `${base} (${reason})`
+    : base;
+}
+
+const PANEL_BUTTON = `${BUTTON_BASE} ${SIZE_CLASSES.sm} border-slate-300 bg-white text-slate-700 hover:bg-slate-50`;
+
 function LhimsAssistPanel({ lhims }) {
-  const { stage, problem, reason, warn, breakerTripped, manuallyConfirmed } =
-    lhims;
+  const {
+    stage,
+    problem,
+    reason,
+    warn,
+    breakerTripped,
+    manuallyConfirmed,
+    auto,
+    runActive,
+  } = lhims;
   const bad =
     Boolean(problem) || stage === "MISMATCH" || stage === "UNVERIFIED";
-  const tone =
-    stage === "VERIFIED"
-      ? "border-emerald-200 bg-emerald-50 text-emerald-900"
-      : bad
-        ? "border-rose-200 bg-rose-50 text-rose-900"
-        : "border-sky-200 bg-sky-50 text-sky-900";
-  const text =
-    REASON_TEXT[problem?.code] ??
-    (stage === "NEEDS_ATTENTION"
-      ? (REASON_TEXT[reason] ?? `Could not continue (${reason}).`)
-      : STAGE_TEXT[stage]);
+  let tone = "border-sky-200 bg-sky-50 text-sky-900";
+  if (stage === "VERIFIED")
+    tone = "border-emerald-200 bg-emerald-50 text-emerald-900";
+  else if (bad) tone = "border-rose-200 bg-rose-50 text-rose-900";
+
   const canRetry =
     ["NEEDS_ATTENTION", "LOGGED_OUT", "EXTENSION_ERROR"].includes(stage) &&
-    !breakerTripped;
+    !breakerTripped &&
+    !auto &&
+    !runActive;
+  const canConfirm =
+    (stage === "UNVERIFIED" || reason === "ALREADY_ATTACHED") &&
+    !manuallyConfirmed;
 
   return (
     <div
@@ -235,14 +285,14 @@ function LhimsAssistPanel({ lhims }) {
       className={`mt-5 rounded-md border px-4 py-3 text-sm ${tone}`}
     >
       <p className="font-medium">LHIMS Assist</p>
-      <p className="mt-0.5">{text}</p>
+      <p className="mt-0.5">{lhimsText(lhims)}</p>
       {warn && <p className="mt-1 text-xs">Note: {warn}</p>}
       <div className="mt-2 flex flex-wrap gap-2">
         {breakerTripped && (
           <button
             type="button"
             onClick={lhims.ackBreaker}
-            className={`${BUTTON_BASE} ${SIZE_CLASSES.sm} border-slate-300 bg-white text-slate-700 hover:bg-slate-50`}
+            className={PANEL_BUTTON}
           >
             Acknowledge and resume
           </button>
@@ -251,12 +301,12 @@ function LhimsAssistPanel({ lhims }) {
           <button
             type="button"
             onClick={lhims.startJob}
-            className={`${BUTTON_BASE} ${SIZE_CLASSES.sm} border-slate-300 bg-white text-slate-700 hover:bg-slate-50`}
+            className={PANEL_BUTTON}
           >
             Retry
           </button>
         )}
-        {stage === "UNVERIFIED" && !manuallyConfirmed && (
+        {canConfirm && (
           <button
             type="button"
             onClick={() =>
@@ -264,7 +314,7 @@ function LhimsAssistPanel({ lhims }) {
                 "Have you confirmed in LHIMS that the file is attached to the right patient?",
               ) && lhims.confirmManually()
             }
-            className={`${BUTTON_BASE} ${SIZE_CLASSES.sm} border-slate-300 bg-white text-slate-700 hover:bg-slate-50`}
+            className={PANEL_BUTTON}
           >
             I checked LHIMS
           </button>
@@ -274,6 +324,10 @@ function LhimsAssistPanel({ lhims }) {
   );
 }
 
+/**
+ * The single referral the officer is working on. Mount with
+ * `key={referral.id}` so the safeguards are per patient.
+ */
 export function ActiveReferralCard({
   referral,
   formsFolder,
@@ -287,13 +341,27 @@ export function ActiveReferralCard({
     flow;
 
   const viaExtension = lhims.extensionPresent;
-  // Extension present: Mark Done needs VERIFIED (or the officer's manual confirmation).
-  // Extension absent: the existing copy + download + countdown guard.
+  // While the auto run is active the run itself marks done / skips, so the
+  // manual buttons stay off. Otherwise: with the extension, Mark Done needs
+  // VERIFIED (or the officer's manual confirmation); without it, the
+  // existing copy + download + countdown guard applies.
   const canMarkDone = viaExtension
-    ? lhims.verified || lhims.manuallyConfirmed
+    ? !lhims.runActive && (lhims.verified || lhims.manuallyConfirmed)
     : unlocked;
   // Skip keeps the countdown guard, and is also allowed on NEEDS_ATTENTION.
-  const canSkip = unlocked || lhims.stage === "NEEDS_ATTENTION";
+  const canSkip =
+    !lhims.runActive && (unlocked || lhims.stage === "NEEDS_ATTENTION");
+
+  let hint = unlockHint(flow);
+  if (viaExtension) {
+    if (lhims.runActive)
+      hint =
+        "Auto attach is running. Press Stop in the bar above to take over manually.";
+    else if (lhims.verified) hint = "Verified in LHIMS. Mark Done.";
+    else
+      hint =
+        "Mark Done unlocks once LHIMS Assist verifies the attachment. Can't attach it? Skip.";
+  }
 
   return (
     <article
@@ -373,13 +441,7 @@ export function ActiveReferralCard({
           />
         </div>
 
-        <p className="mt-3 text-sm text-slate-500">
-          {viaExtension
-            ? lhims.verified
-              ? "Verified in LHIMS. Mark Done."
-              : "Mark Done unlocks once LHIMS Assist verifies the attachment. Can't attach it? Skip."
-            : unlockHint(flow)}
-        </p>
+        <p className="mt-3 text-sm text-slate-500">{hint}</p>
       </div>
     </article>
   );

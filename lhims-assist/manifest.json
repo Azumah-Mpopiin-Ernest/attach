@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "LHIMS Referral Assist",
-  "version": "0.2.0",
-  "description": "Assists attaching referral forms in LHIMS. Local only, never saves for you.",
+  "version": "0.3.0",
+  "description": "Assists and automates attaching referral forms in LHIMS. Local only.",
   "minimum_chrome_version": "120",
   "permissions": [
     "storage",
@@ -22,6 +22,17 @@
         "relay.js"
       ],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://10.10.16.50/lhims_*/*"
+      ],
+      "js": [
+        "dialogs.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
     },
     {
       "matches": [

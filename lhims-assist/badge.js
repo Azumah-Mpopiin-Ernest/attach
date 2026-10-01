@@ -6,7 +6,7 @@ globalThis.LA_Badge = (() => {
       "Open the patient list tab you want to use, then press the button.",
     ],
     TAB_CLAIMED: ["info", "Starting", "Starting the search…"],
-    SEARCHING: ["info", "Searching", "Looking for an exact patient match…"],
+    SEARCHING: ["info", "Searching", "Looking for the patient…"],
     MATCHED: ["info", "Match found", "Opening the attachment page…"],
     ON_ATTACHMENT_PAGE: [
       "info",
@@ -22,63 +22,130 @@ globalThis.LA_Badge = (() => {
       "Check the page, then click Save.",
     ],
     SAVE_CLICKED: ["info", "Saving", "Waiting to confirm the file saved…"],
-    VERIFIED: ["ok", "Verified", "Saved. Go back to the app and mark it done."],
-    MISMATCH: ["bad", "Wrong patient", "Wrong patient: stop. Do not save."],
+    VERIFIED: ["ok", "Verified", "Saved and verified."],
+    MISMATCH: [
+      "bad",
+      "Wrong patient",
+      "Wrong patient: stop. Nothing was saved.",
+    ],
     UNVERIFIED: [
       "bad",
       "Not verified",
       "Could not confirm the save. Check the attachment in LHIMS, then use the app.",
     ],
-    LOGGED_OUT: [
-      "bad",
-      "Logged out",
-      "Log in to LHIMS, then restart the job from the app.",
-    ],
+    LOGGED_OUT: ["bad", "Logged out", "Log in to LHIMS, then start again."],
     EXTENSION_ERROR: ["bad", "Extension error", "Continue manually."],
   };
   const REASONS = {
     NO_MATCH: "No exact match: skip in the app.",
     MULTIPLE_MATCHES: "Several matches: skip in the app.",
+    NO_USABLE_ROW: "All matching rows are green or red: skip in the app.",
     TIMEOUT: "Timed out. Finish manually or skip in the app.",
     TAB_CLOSED: "Tab was closed. Restart from the app.",
-    NO_USABLE_ROW: "All matching rows are green or red: skip in the app.",
+    ALREADY_ATTACHED:
+      "This visit already shows the referral note. Check LHIMS before doing anything.",
+    UNEXPECTED_DIALOG:
+      "LHIMS showed a message the extension did not expect. Look at the page.",
+    NAME_NOT_VERIFIABLE: "The patient name could not be read on the page.",
+  };
+  const STOP_TEXT = {
+    DONE: "Finished: no referrals left.",
+    OFFICER_STOP: "Stopped.",
+    NO_READY_TAB: "No list tab became ready. Check the tabs, then start again.",
+    APP_CLOSED: "The app tab was closed, so the run stopped.",
   };
 
   let host, els, handlers;
+  const isActive = (s) =>
+    !!s.run && (s.run.status === "RUNNING" || s.run.status === "STOPPING");
 
   function describe(state, ctx) {
-    const s = state.stage;
-    if (!s || s === "IDLE") return null;
-    if (ctx.role === "other")
+    const s = state.stage,
+      run = state.run,
+      active = isActive(state);
+    const stop = active
+      ? [
+          {
+            id: "stop",
+            label:
+              run.status === "STOPPING"
+                ? "Stopping after this patient…"
+                : "Stop auto run",
+          },
+        ]
+      : [];
+
+    if (ctx.page === "FILTER" && !active) {
+      const why =
+        run?.status === "STOPPED" && run.stopReason
+          ? STOP_TEXT[run.stopReason] ||
+            `Last run stopped: ${REASONS[run.stopReason] || run.stopReason}`
+          : "";
       return {
-        tone: "info",
-        title: "Busy",
-        line: "Another tab is handling the current referral.",
+        tone:
+          why && run.stopReason !== "DONE" && run.stopReason !== "OFFICER_STOP"
+            ? "warn"
+            : "info",
+        title: "Auto attach",
+        line: why || "Attach every referral in the app queue automatically.",
+        actions: [{ id: "start", label: "Start auto run" }],
       };
+    }
+    if (!s || s === "IDLE")
+      return active
+        ? {
+            tone: "info",
+            title: "Auto run",
+            line: "Waiting for the next referral…",
+            actions: ctx.page === "FILTER" ? stop : [],
+          }
+        : null;
+    if (ctx.role === "other")
+      return active
+        ? {
+            tone: "info",
+            title: "Auto run",
+            line: "This tab is part of the auto-run pool.",
+          }
+        : {
+            tone: "info",
+            title: "Busy",
+            line: "Another tab is handling the current referral.",
+          };
     if (s === "NEEDS_ATTENTION")
       return {
         tone: "bad",
         title: "Needs attention",
-        line:
-          REASONS[state.reason] ||
-          `Could not continue (${state.reason}). Finish manually or skip in the app.`,
+        line: REASONS[state.reason] || `Could not continue (${state.reason}).`,
+        actions: stop,
       };
     const [tone, title, line0] = TXT[s] || ["info", s, ""];
     const line =
       line0 + (s === "UNVERIFIED" && state.reason ? ` (${state.reason})` : "");
-    if (s === "JOB_RECEIVED" && ctx.role === "candidate" && ctx.page !== "LIST")
+    if (s === "JOB_RECEIVED" && ctx.role === "candidate") {
+      if (active)
+        return {
+          tone,
+          title: "Auto run",
+          line: "Waiting for a ready list tab…",
+          actions: stop,
+        };
+      if (ctx.page !== "LIST")
+        return {
+          tone,
+          title,
+          line: "This is not a patient-list tab. Switch to one.",
+        };
       return {
         tone,
         title,
-        line: "This is not a patient-list tab. Switch to one.",
+        line,
+        actions: [
+          { id: "claim", label: "Use this tab for the current referral" },
+        ],
       };
-    return {
-      tone,
-      title,
-      line,
-      claim:
-        s === "JOB_RECEIVED" && ctx.role === "candidate" && ctx.page === "LIST",
-    };
+    }
+    return { tone, title, line, actions: stop };
   }
 
   function mount(h) {
@@ -96,17 +163,17 @@ globalThis.LA_Badge = (() => {
         .bd{padding:8px 10px}.pt{font-family:ui-monospace,monospace;font-size:12px;color:#444;margin-bottom:4px}
         .wn{color:#92400e;font-size:12px;margin-top:4px}
         button{margin-top:8px;width:100%;padding:7px;border:0;border-radius:6px;background:#16a34a;color:#fff;font-weight:600;cursor:pointer}
+        button.stop{background:#dc2626}
       </style>
-      <div class="card"><div class="hd"></div><div class="bd"><div class="pt"></div><div class="ln"></div><div class="wn"></div><button hidden>Use this tab for the current referral</button></div></div>`;
+      <div class="card"><div class="hd"></div><div class="bd"><div class="pt"></div><div class="ln"></div><div class="wn"></div><div class="acts"></div></div></div>`;
     els = {
       card: root.querySelector(".card"),
       hd: root.querySelector(".hd"),
       pt: root.querySelector(".pt"),
       ln: root.querySelector(".ln"),
       wn: root.querySelector(".wn"),
-      btn: root.querySelector("button"),
+      acts: root.querySelector(".acts"),
     };
-    els.btn.addEventListener("click", () => handlers.onClaim());
     try {
       const pos = JSON.parse(localStorage.getItem("la_badge_pos") || "null");
       if (pos)
@@ -159,12 +226,22 @@ globalThis.LA_Badge = (() => {
     host.style.display = "block";
     els.card.dataset.tone = d.tone;
     els.hd.textContent = `LHIMS Assist · ${d.title}`;
-    els.pt.textContent = state.patientId
-      ? `${state.patientId}  ${state.shape || ""}`
-      : "";
+    els.pt.textContent =
+      state.patientId && ctx.role !== "other"
+        ? `${state.patientId}  ${state.shape || ""}`
+        : "";
     els.ln.textContent = d.line;
-    els.wn.textContent = state.warn ? `Note: ${state.warn}` : "";
-    els.btn.hidden = !d.claim;
+    els.wn.textContent =
+      state.warn && ctx.role !== "other" ? `Note: ${state.warn}` : "";
+    els.acts.replaceChildren(
+      ...(d.actions || []).map((a) => {
+        const b = document.createElement("button");
+        b.textContent = a.label;
+        if (a.id === "stop") b.className = "stop";
+        b.addEventListener("click", () => handlers.onAction(a.id));
+        return b;
+      }),
+    );
   }
 
   function flash(text) {

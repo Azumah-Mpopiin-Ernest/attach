@@ -1,9 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  renderReferralFormJpegBlob,
-  referralFormFileName,
-} from "../referralForm"; // adjust path
 import { request, subscribe } from "./lhimsBridge";
+import { buildJob } from "./lhimsJob";
 
 const PROBLEM_STAGES = new Set([
   "NEEDS_ATTENTION",
@@ -12,6 +9,8 @@ const PROBLEM_STAGES = new Set([
   "LOGGED_OUT",
   "EXTENSION_ERROR",
 ]);
+const isRunActive = (run) =>
+  run?.status === "RUNNING" || run?.status === "STOPPING";
 const flagKey = (kind, id) => `lhims:${kind}:${id}`;
 const readFlag = (kind, id) => {
   try {
@@ -28,32 +27,18 @@ const writeFlag = (kind, id) => {
   }
 };
 
-const blobToBase64 = (blob) =>
-  new Promise((resolve, reject) => {
-    const fr = new FileReader();
-    fr.onload = () => resolve(String(fr.result).split(",")[1]);
-    fr.onerror = () => reject(fr.error);
-    fr.readAsDataURL(blob);
-  });
-
-const sha256Hex = async (blob) => {
-  if (!globalThis.crypto?.subtle) return null; // insecure origin: the extension still checks the length
-  const buf = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
-  return [...new Uint8Array(buf)]
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-};
-
+// Per-referral view of the extension. Sends a manual (officer-saves) job only while no auto run is active.
 export function useLhimsAutomation(referral) {
   const id = referral.id;
   const [extensionPresent, setPresent] = useState(false);
   const [state, setState] = useState({ stage: "IDLE" });
+  const [runActive, setRunActive] = useState(false);
   const [localProblem, setLocalProblem] = useState(null);
   const [breaker, setBreaker] = useState({ fails: 0, tripped: false });
   const [manuallyConfirmed, setManual] = useState(() => readFlag("manual", id));
 
   const referralRef = useRef(referral);
-  const aliveRef = useRef(true);
+  const runActiveRef = useRef(false);
   useEffect(() => {
     referralRef.current = referral;
   });
@@ -73,8 +58,12 @@ export function useLhimsAutomation(referral) {
       if (!alive) return;
       if (m.type === "READY") probe();
       if (m.type === "STATE") {
+        const active = isRunActive(m.state.run);
+        runActiveRef.current = active;
+        setRunActive(active);
         if (m.state.breaker) setBreaker(m.state.breaker);
         if (m.state.referralId === id) setState(m.state);
+        else if (m.state.stage === "IDLE") setState({ stage: "IDLE" });
       }
     });
     probe();
@@ -86,56 +75,41 @@ export function useLhimsAutomation(referral) {
     };
   }, [id]);
 
-  const submitJob = useCallback(
-    async (retry, isAlive = () => aliveRef.current) => {
-      const r = referralRef.current;
-      setLocalProblem(null);
-      let blob;
-      try {
-        blob = await renderReferralFormJpegBlob(r);
-      } catch {
-        setLocalProblem({ code: "FORM_RENDER_FAILED" });
-        return;
-      }
-      const bytesB64 = await blobToBase64(blob);
-      const sha256 = await sha256Hex(blob);
-      if (!isAlive()) return; // card unmounted while rendering: never send a stale job
-      const res = await request(
-        "SUBMIT_JOB",
-        {
-          referralId: r.id,
-          patientId: r.patientId,
-          expectedFileName: referralFormFileName(r),
-          mimeType: "image/jpeg",
-          size: blob.size,
-          bytesB64,
-          sha256,
-          retry,
-        },
-        15000,
-      );
-      if (!isAlive()) return;
-      if (!res.ok) setLocalProblem({ code: res.error });
-      else setState(res.state);
-    },
-    [],
-  );
+  const submitJob = useCallback(async (retry, isAlive = () => true) => {
+    const r = referralRef.current;
+    setLocalProblem(null);
+    let job;
+    try {
+      job = await buildJob(r);
+    } catch {
+      setLocalProblem({ code: "FORM_RENDER_FAILED" });
+      return;
+    }
+    if (!isAlive()) return; // card unmounted while rendering: never send a stale job
+    const res = await request("SUBMIT_JOB", { ...job, retry }, 15000);
+    if (!isAlive()) return;
+    if (!res.ok) setLocalProblem({ code: res.error });
+    else setState(res.state);
+  }, []);
 
-  // 2) job lifecycle: adopt, send, cancel on change/unmount
+  // 2) job lifecycle: adopt, send (manual mode only), cancel on change/unmount
   useEffect(() => {
     if (!extensionPresent) return undefined;
     let cancelled = false;
-    aliveRef.current = true;
     (async () => {
       try {
         const cur = await request("GET_STATE", {});
         if (cancelled) return;
         setBreaker(cur.breaker);
+        const active = isRunActive(cur.run);
+        runActiveRef.current = active;
+        setRunActive(active);
         if (cur.referralId === id && cur.stage !== "IDLE") {
           setState(cur);
           return;
-        } // adopt after app reload
-        if (readFlag("verified", id) || readFlag("manual", id)) return; // already handled this session
+        } // adopt after app reload / auto run
+        if (active) return; // the auto run controller sends the jobs
+        if (readFlag("verified", id) || readFlag("manual", id)) return;
         if (cur.breaker?.tripped) {
           setLocalProblem({ code: "BREAKER_TRIPPED" });
           return;
@@ -148,8 +122,8 @@ export function useLhimsAutomation(referral) {
     })();
     return () => {
       cancelled = true;
-      aliveRef.current = false;
-      request("CANCEL_JOB", { referralId: id }).catch(() => {}); // clears job + bytes in the extension
+      if (!runActiveRef.current)
+        request("CANCEL_JOB", { referralId: id }).catch(() => {}); // never cancel an auto job
     };
   }, [extensionPresent, id, submitJob]);
 
@@ -186,6 +160,8 @@ export function useLhimsAutomation(referral) {
     cancelJob,
     reason: state.reason || null,
     warn: state.warn || null,
+    auto: !!state.auto,
+    runActive,
     breakerTripped: breaker.tripped,
     ackBreaker,
     manuallyConfirmed,

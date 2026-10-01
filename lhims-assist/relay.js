@@ -7,7 +7,10 @@
     "SUBMIT_JOB",
     "CANCEL_JOB",
     "ACK_BREAKER",
+    "RUN_START",
+    "RUN_STOP",
   ]);
+  const TO_APP = new Set(["STATE", "RUN_REQUEST"]);
   if (!LA_CONFIG.APP_ORIGINS.includes(location.origin)) return; // exact-origin check (manifest ignores ports)
 
   const post = (m) =>
@@ -35,9 +38,15 @@
   });
 
   chrome.runtime.onMessage.addListener((m, sender) => {
-    if (sender.id !== chrome.runtime.id) return;
-    if (m?.channel === "TO_APP" && m.type === "STATE")
-      post({ type: "STATE", state: m.state }); // stage/reason only
+    if (
+      sender.id !== chrome.runtime.id ||
+      m?.channel !== "TO_APP" ||
+      !TO_APP.has(m.type)
+    )
+      return;
+    post(
+      m.type === "STATE" ? { type: "STATE", state: m.state } : { type: m.type },
+    );
   });
 
   post({ type: "READY" });

@@ -9,7 +9,6 @@ if ([...C.LHIMS_URL_PATTERNS, ...C.APP_ORIGINS].some((s) => s.includes("<"))) {
   console.error("Fill the placeholders in config.js first.");
   process.exit(1);
 }
-// Chrome ignores ports in match patterns; the scripts enforce the exact origin at runtime.
 const appMatches = C.APP_ORIGINS.map((o) => {
   const u = new URL(o);
   return `${u.protocol}//${u.hostname}/*`;
@@ -18,9 +17,9 @@ const appMatches = C.APP_ORIGINS.map((o) => {
 const manifest = {
   manifest_version: 3,
   name: "LHIMS Referral Assist",
-  version: "0.2.0",
+  version: "0.3.0",
   description:
-    "Assists attaching referral forms in LHIMS. Local only, never saves for you.",
+    "Assists and automates attaching referral forms in LHIMS. Local only.",
   minimum_chrome_version: "120",
   permissions: ["storage", "alarms"],
   background: { service_worker: "sw.js" },
@@ -29,6 +28,14 @@ const manifest = {
       matches: appMatches,
       js: ["config.js", "relay.js"],
       run_at: "document_idle",
+    },
+    // Runs inside the page itself so it can answer the page's confirm() dialogs.
+    {
+      matches: C.LHIMS_URL_PATTERNS,
+      js: ["dialogs.js"],
+      run_at: "document_start",
+      world: "MAIN",
+      all_frames: false,
     },
     {
       matches: C.LHIMS_URL_PATTERNS,

@@ -5,6 +5,7 @@
 
   const C = LA_CONFIG,
     S = C.SELECTORS,
+    A = C.AUTO,
     Badge = LA_Badge;
   const dbg = (...a) => C.DEBUG && console.debug("[LHIMS-Assist]", ...a);
   const TERMINAL = new Set([
@@ -23,13 +24,19 @@
     "TYPE_SET",
     "READY_FOR_SAVE",
   ];
+  const START_ERRORS = {
+    APP_NOT_CONNECTED:
+      "Open the referral app in this browser first (same profile), then try again.",
+    ALREADY_RUNNING: "An auto run is already active.",
+  };
 
   let myTabId = null,
     state = { stage: "IDLE" },
     running = false,
     aborted = false,
     verifying = false,
-    armedFor = null;
+    armedFor = null,
+    activeJob = null;
 
   class Problem extends Error {
     constructor(stage, reason) {
@@ -88,10 +95,7 @@
         characterData: true,
       });
     });
-  const quietFor = (
-    root,
-    ms, // resolves after `ms` without mutations (short debounce only)
-  ) =>
+  const quietFor = (root, ms) =>
     new Promise((resolve) => {
       let t = setTimeout(done, ms);
       const mo = new MutationObserver(() => {
@@ -125,11 +129,19 @@
         ? "UPDATE"
         : p.endsWith(C.PAGES.view)
           ? "VIEW"
-          : "OTHER";
+          : p.endsWith(C.PAGES.filter)
+            ? "FILTER"
+            : "OTHER";
   };
+  const listDate = () =>
+    new URL(location.href).searchParams.get("dScheduleDate");
   const isLoggedOut = () =>
     !document.querySelector(S.session.loggedIn) &&
     vis(S.login.password).length > 0;
+  const listReady = () =>
+    !!document.querySelector(S.list.patientSelect) &&
+    !!document.querySelector(S.list.grid) &&
+    !isLoggedOut();
   const saveKey = (job) => `__la_save_${job.jobId}`;
   const baseKey = (job) => `__la_base_${job.jobId}`;
   const ctx = () => ({
@@ -142,6 +154,32 @@
         : state.claimedTabId === myTabId
           ? "owner"
           : "other",
+  });
+
+  // ---------- dialogs (auto mode only) ----------
+  const root = document.documentElement;
+  const setAuto = (on) => {
+    // dialogs.js (page world) reads these two attributes
+    if (on) {
+      root.dataset.laAllow = JSON.stringify(A.CONFIRMS);
+      root.dataset.laAuto = "1";
+    } else delete root.dataset.laAuto;
+  };
+  document.addEventListener("la-dialog", (e) => {
+    let d;
+    try {
+      d = JSON.parse(e.detail);
+    } catch {
+      return;
+    }
+    dbg("dialog", d.kind, d.accepted ? "ACCEPTED" : "REFUSED", d.message);
+    if (d.accepted || !activeJob?.auto) return;
+    handleError(
+      new Problem(
+        state.stage === "SAVE_CLICKED" ? "UNVERIFIED" : "NEEDS_ATTENTION",
+        "UNEXPECTED_DIALOG",
+      ),
+    );
   });
 
   // ---------- messaging ----------
@@ -180,7 +218,7 @@
     const max = Math.max(r, g, b),
       min = Math.min(r, g, b),
       d = max - min;
-    if (d < C.ROW_COLOR.minChroma) return "other"; // white / grey
+    if (d < C.ROW_COLOR.minChroma) return "other";
     let h =
       max === r
         ? ((g - b) / d) % 6
@@ -194,7 +232,6 @@
     return "other";
   }
   function rowColor(block) {
-    // nearest coloured background: the row block, then its ancestors up to the <tr>
     for (let n = block; n; n = n.parentElement) {
       const c = parseRgb(getComputedStyle(n).backgroundColor);
       if (c && c.a > 0.05) {
@@ -204,6 +241,20 @@
       if (n.tagName === "TR") break;
     }
     return "other";
+  }
+
+  // ---------- name comparison (order and middle names tolerated) ----------
+  const tokens = (s) =>
+    norm(String(s).replace(/[<>:"/\\|?*.,'’-]/g, " "))
+      .split(" ")
+      .filter(Boolean);
+  function namesAgree(a, b) {
+    const X = tokens(a),
+      Y = tokens(b);
+    if (!X.length || !Y.length) return false;
+    const [small, big] = X.length <= Y.length ? [X, Y] : [Y, X];
+    if (small.length < 2 && X.length !== Y.length) return false;
+    return small.every((t) => big.includes(t));
   }
 
   // ---------- steps 1-3: search, pick the right visit, open attachment page ----------
@@ -217,11 +268,11 @@
       return m && norm(m[1]) === want;
     });
     if (opts.length === 0) throw new Problem("NEEDS_ATTENTION", "NO_MATCH");
-    setNative(sel, opts[0].value); // duplicates in the dropdown: the first one is used
+    setNative(sel, opts[0].value);
     if (sel.value !== opts[0].value)
       throw new Problem("NEEDS_ATTENTION", "SELECT_NOT_SET");
     const btn = one("searchButton", S.list.searchButton);
-    await progress("SEARCHING", { searchClicked: true }); // persisted before the click: the page may reload
+    await progress("SEARCHING", { searchClicked: true });
     btn.click();
     return evaluateResults(job);
   }
@@ -231,7 +282,7 @@
     if (!grid) throw new Problem("NEEDS_ATTENTION", "SELECTOR_grid_0");
     const want = norm(job.patientId);
     await new Promise((r) => setTimeout(r, 300));
-    await quietFor(grid, C.SETTLE_MS); // always: all result rows must be rendered before one is chosen
+    await quietFor(grid, C.SETTLE_MS);
     guard();
 
     const found = vis(S.list.patientLink, grid).filter(
@@ -266,7 +317,7 @@
       how = `${rows.length} visits found; used the ${pick.color === "yellow" ? "yellow" : "first"} one`;
     }
 
-    const icon = one("updateIcon", S.list.updateIcon, pick.block); // this row only
+    const icon = one("updateIcon", S.list.updateIcon, pick.block);
     const sid = (icon.getAttribute("onclick") || "").match(
       /fUpdateSchedule\(\s*(\d+)/,
     )?.[1];
@@ -275,7 +326,7 @@
       scheduleId: sid,
       ...(how ? { warn: how } : {}),
     });
-    icon.click(); // same-tab navigation; the next page load resumes
+    icon.click(); // same-tab navigation; in auto mode the update confirmation is accepted by dialogs.js
   }
 
   // ---------- steps 4-9: attachment page ----------
@@ -292,14 +343,12 @@
       t.selectedOptions[0]?.text.trim() === C.ATTACHMENT_TYPE_TEXT;
     return { ok, f, n, t };
   };
-
   const hrefsIn = (doc) =>
     [...doc.querySelectorAll(S.verify.downloadLink)].map(
       (a) => a.getAttribute("href") || "",
     );
 
   async function captureBaseline(job) {
-    // read-only GET of this visit's view page, same origin
     try {
       const u = new URL(C.PAGES.view, location.href);
       u.searchParams.set("iScheduleID", String(job.scheduleId));
@@ -312,7 +361,7 @@
         await res.text(),
         "text/html",
       );
-      if (!doc.querySelector(S.session.loggedIn)) return null; // login redirect or error page
+      if (!doc.querySelector(S.session.loggedIn)) return null;
       const hrefs = hrefsIn(doc);
       try {
         sessionStorage.setItem(baseKey(job), JSON.stringify(hrefs));
@@ -343,15 +392,20 @@
       throw new Problem("MISMATCH", "SCHEDULE_ID_MISMATCH_FORM");
 
     let warn = null;
-    if (C.NAME_CHECK !== "off") {
-      const el = vis(S.update.patientName)[0];
-      const clean = (s) => norm(s.replace(/[<>:"/\\|?*]/g, " "));
-      if (!el) warn = "name not verifiable";
-      else if (
-        clean(el.textContent) !==
-        clean(job.expectedFileName.replace(/\.[^.]+$/, ""))
-      ) {
-        if (C.NAME_CHECK === "strict")
+    const nameMode = job.auto ? "strict" : C.NAME_CHECK;
+    if (nameMode !== "off") {
+      const named = all(S.update.patientName).filter((e) =>
+        e.textContent.trim(),
+      );
+      const el = named.find(visible) || named[0]; // the name is in the DOM even when its tab is not shown
+      dbg("name element", named.length, !!el && visible(el));
+      const wantName = job.expectedFileName.replace(/\.[^.]+$/, "");
+      if (!el) {
+        if (nameMode === "strict")
+          throw new Problem("NEEDS_ATTENTION", "NAME_NOT_VERIFIABLE");
+        warn = "name not verifiable";
+      } else if (!namesAgree(el.textContent, wantName)) {
+        if (nameMode === "strict")
           throw new Problem("MISMATCH", "NAME_MISMATCH");
         warn = "name differs from referral";
       }
@@ -365,6 +419,13 @@
         vis(S.update.type).length,
     );
     guard();
+    // The update page lists the visit's saved attachments: an existing "Internal Referral Form" means this may already be done.
+    if (
+      job.auto &&
+      A.STOP_IF_NOTE_PRESENT &&
+      norm(document.body.innerText).includes(norm(C.NOTE_TEXT))
+    )
+      throw new Problem("NEEDS_ATTENTION", "ALREADY_ATTACHED");
     const f = one("fileInput", S.update.fileInput),
       n = one("note", S.update.note),
       t = one("type", S.update.type);
@@ -414,14 +475,35 @@
       throw new Problem("NEEDS_ATTENTION", "FINAL_READBACK_FAILED");
     const baseline = await captureBaseline(job);
     guard();
+    if (job.auto && baseline == null)
+      throw new Problem("NEEDS_ATTENTION", "NO_BASELINE"); // never save what cannot be verified
     await progress("READY_FOR_SAVE", {
       baseline,
       ...(baseline == null ? { warn: "Save cannot be auto-verified" } : {}),
     });
-    armSave(job); // STOP. Never clicks Save.
+    if (job.auto) return autoSave(job);
+    armSave(job); // manual mode: STOP. The officer clicks Save.
   }
 
-  // ---------- step 10: officer's Save, then verification on the redirected view page ----------
+  // ---------- step 10: Save (auto or by the officer), then verification on the redirected view page ----------
+  async function autoSave(job) {
+    if (!readback().ok)
+      throw new Problem("NEEDS_ATTENTION", "FINAL_READBACK_FAILED");
+    const btn = one("saveButton", S.update.saveButton);
+    try {
+      sessionStorage.setItem(saveKey(job), String(Date.now()));
+    } catch {
+      /* ignore */
+    }
+    const r = await sw({ type: "SAVE_CLICKED", fieldsOk: true }); // persisted first: a reload after the click is still understood
+    if (!r?.ok) throw new Error("ABORTED"); // job cancelled or stopped before Save: do not click
+    state = r.state;
+    Badge.render(state, ctx());
+    guard();
+    dbg("auto save: clicking Save");
+    btn.click(); // the "Do You Really Want To Save ?" confirmation is accepted by dialogs.js
+  }
+
   async function fetchSize(href) {
     try {
       const res = await fetch(href, {
@@ -453,8 +535,8 @@
           sessionStorage.setItem(saveKey(job), String(Date.now()));
         } catch {
           /* ignore */
-        } // survives the redirect
-        const fieldsOk = readback().ok; // observed only, never blocks the officer
+        }
+        const fieldsOk = readback().ok;
         sw({ type: "SAVE_CLICKED", fieldsOk })
           .then((r) => {
             if (r?.ok) {
@@ -464,7 +546,6 @@
             }
           })
           .catch(() => {});
-        // verification happens on the next page load (viewSchedule.php)
       },
       true,
     );
@@ -484,7 +565,7 @@
         throw new Problem("UNVERIFIED", "WRONG_SCHEDULE_AFTER_SAVE");
       if (job.baseline == null) throw new Problem("UNVERIFIED", "NO_BASELINE");
 
-      const links = all(S.verify.downloadLink); // no visibility filter: baseline was parsed from raw HTML
+      const links = all(S.verify.downloadLink);
       const delta = links.length - job.baseline;
       dbg("links before/after/delta", job.baseline, links.length, delta);
       if (delta <= 0) throw new Problem("UNVERIFIED", "NO_NEW_ATTACHMENT");
@@ -507,12 +588,16 @@
       );
 
       let warn = null;
-      if (C.VERIFY_BYTES !== "off") {
+      const mode = job.auto ? "strict" : C.VERIFY_BYTES;
+      if (mode !== "off") {
         const size = await fetchSize(target.href);
         dbg("stored size", size, "sent size", job.size);
-        if (size == null) warn = "content not checked";
-        else if (size !== job.size) {
-          if (C.VERIFY_BYTES === "strict")
+        if (size == null) {
+          if (mode === "strict")
+            throw new Problem("UNVERIFIED", "CONTENT_NOT_CHECKED");
+          warn = "content not checked";
+        } else if (size !== job.size) {
+          if (mode === "strict")
             throw new Problem("UNVERIFIED", "BYTES_DIFFER");
           warn = "stored size differs from sent file";
         }
@@ -540,24 +625,22 @@
     if (page === "LIST") {
       if (st === "TAB_CLAIMED" || (st === "SEARCHING" && !job.searchClicked))
         return doSearch(job);
-      if (st === "SEARCHING") return evaluateResults(job); // page reloaded after the search click
+      if (st === "SEARCHING") return evaluateResults(job);
       if (st === "SAVE_CLICKED")
         throw new Problem("UNVERIFIED", "NAVIGATED_AWAY_AFTER_SAVE");
       throw new Problem("NEEDS_ATTENTION", "UNEXPECTED_PAGE");
     }
     if (page === "UPDATE") {
       if (st === "SAVE_CLICKED") {
-        armSave(job);
+        if (!job.auto) armSave(job);
         return;
-      } // Save clicked but still on the form (validation error): officer fixes and re-clicks
+      } // still on the form: wait (the watchdog times it out)
       if (PRE_SAVE.includes(st)) return doAttach(job); // a reload resets the form, so redo from scratch
       throw new Problem("NEEDS_ATTENTION", "UNEXPECTED_PAGE");
     }
     if (page === "VIEW") {
-      // Save succeeded and LHIMS redirected here
       if (st === "SAVE_CLICKED") return verifyAfterSave(job);
       if (st === "READY_FOR_SAVE" && sessionStorage.getItem(saveKey(job))) {
-        // the Save message never reached the SW
         const r = await sw({ type: "SAVE_CLICKED", fieldsOk: null });
         if (r?.ok) {
           state = r.state;
@@ -590,6 +673,8 @@
   async function resume(job) {
     if (running) return;
     running = true;
+    activeJob = job;
+    if (job.auto) setAuto(true);
     try {
       await route(job);
     } catch (e) {
@@ -600,40 +685,77 @@
   }
 
   // ---------- boot ----------
+  async function adoptJob() {
+    // called after a page load or an AUTO_GO message
+    const r = await sw({
+      type: "HELLO",
+      page: pageKind(),
+      date: listDate(),
+      ready: false,
+    });
+    if (!r?.ok) return;
+    myTabId = r.tabId;
+    state = r.state;
+    aborted = TERMINAL.has(state.stage);
+    Badge.render(state, ctx());
+    if (r.job && !TERMINAL.has(state.stage)) resume(r.job);
+  }
+
   chrome.runtime.onMessage.addListener((m, sender) => {
-    if (
-      sender.id !== chrome.runtime.id ||
-      m?.channel !== "TO_LHIMS" ||
-      m.type !== "STATE"
-    )
+    if (sender.id !== chrome.runtime.id || m?.channel !== "TO_LHIMS") return;
+    if (m.type === "AUTO_GO") {
+      adoptJob().catch(handleError);
       return;
+    }
+    if (m.type !== "STATE") return;
     state = m.state;
     aborted = TERMINAL.has(state.stage) || state.stage === "IDLE";
+    const mine = state.claimedTabId != null && state.claimedTabId === myTabId;
+    if (!mine || aborted) setAuto(false);
     Badge.render(state, ctx());
   });
 
-  (async function boot() {
-    Badge.mount({
-      onClaim: async () => {
-        try {
-          const r = await sw({ type: "CLAIM", page: pageKind() });
-          if (!r?.ok)
-            return Badge.flash(
-              r?.error === "NOT_A_PATIENT_LIST_TAB"
-                ? "Not a patient-list tab."
-                : "Cannot claim: " + (r?.error || "unknown"),
-            );
-          state = r.state;
-          aborted = false;
-          Badge.render(state, ctx());
-          resume(r.job);
-        } catch (e) {
-          handleError(e);
-        }
-      },
-    });
+  async function onAction(id) {
     try {
-      const r = await sw({ type: "HELLO", page: pageKind() });
+      if (id === "claim") {
+        const r = await sw({ type: "CLAIM", page: pageKind() });
+        if (!r?.ok)
+          return Badge.flash(
+            r?.error === "NOT_A_PATIENT_LIST_TAB"
+              ? "Not a patient-list tab."
+              : "Cannot claim: " + (r?.error || "unknown"),
+          );
+        state = r.state;
+        aborted = false;
+        Badge.render(state, ctx());
+        resume(r.job);
+      } else if (id === "start") {
+        const r = await sw({ type: "RUN_REQUEST" });
+        Badge.flash(
+          r?.ok
+            ? "Starting… the app is preparing the first referral."
+            : START_ERRORS[r?.error] ||
+                "Could not start: " + (r?.error || "unknown"),
+        );
+      } else if (id === "stop") {
+        await sw({ type: "RUN_STOP" });
+      }
+    } catch {
+      Badge.flash("The extension could not be reached.");
+    }
+  }
+
+  (async function boot() {
+    Badge.mount({ onAction });
+    try {
+      const kind = pageKind();
+      if (kind === "LIST") await loaded();
+      const r = await sw({
+        type: "HELLO",
+        page: kind,
+        date: listDate(),
+        ready: kind === "LIST" && listReady(),
+      });
       if (!r?.ok) return;
       myTabId = r.tabId;
       state = r.state;
@@ -645,5 +767,3 @@
     }
   })();
 })();
-
-

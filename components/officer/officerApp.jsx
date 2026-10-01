@@ -21,6 +21,8 @@ import {
   referralName,
   useSessionDoneCount,
 } from "./referralFlow";
+import { useLhimsRun } from "../../src/lhims/useLhimsRun";
+import LhimsRunBar from "../../src/lhims/LhimsRunBar";
 
 const PAGE_SIZE = 25;
 
@@ -321,6 +323,10 @@ export default function OfficerApp({ officerName, onSignOut }) {
       .finally(() => setUnsynced((count) => Math.max(0, count - 1)));
   };
 
+  // Drives the extension's auto run: sends the next form, marks each
+  // referral done once LHIMS verified it, skips the ones with no match.
+  const lhimsRun = useLhimsRun({ queue, queueLoaded, markDone, skipReferral });
+
   return (
     <OfficerLayout officerName={officerName} onSignOut={onSignOut}>
       <div className="mx-auto w-full max-w-3xl">
@@ -329,6 +335,8 @@ export default function OfficerApp({ officerName, onSignOut }) {
         {(offline || unsynced > 0) && (
           <SyncBanner offline={offline} unsynced={unsynced} />
         )}
+
+        <LhimsRunBar lhims={lhimsRun} />
 
         <FormsFolderBar formsFolder={formsFolder} />
 
