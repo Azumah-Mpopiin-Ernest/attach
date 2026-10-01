@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { downloadReferralForm } from "../../src/referralForm";
 
 const ACTIONS_KEY_PREFIX = "officer-flow:actions:";
 const DONE_COUNT_KEY_PREFIX = "officer-flow:done:";
@@ -8,12 +7,7 @@ const DONE_COUNT_KEY_PREFIX = "officer-flow:done:";
 // locked for this long: time to actually attempt the upload in LHIMS.
 const UNLOCK_SECONDS = 10;
 
-const NO_ACTIONS = {
-  idCopied: false,
-  fileDownloaded: false,
-  fileDragged: false,
-  readyAt: null,
-};
+const NO_ACTIONS = { idCopied: false, fileDownloaded: false, readyAt: null };
 
 // sessionStorage can throw (storage disabled, private mode, quota). The
 // workflow must keep working without persistence, so every access is guarded.
@@ -41,18 +35,12 @@ function removeSession(key) {
   }
 }
 
-// The form counts as handed over once it was downloaded OR dragged into
-// LHIMS (the drop was accepted by the target).
-function formHandedOver(actions) {
-  return actions.fileDownloaded || actions.fileDragged;
-}
-
 // Applies `patch` and stamps `readyAt` (when the countdown started) the
 // moment both prerequisites are first satisfied. `now` is passed in so this
 // stays a pure function.
 function withAction(current, patch, now) {
   const next = { ...current, ...patch };
-  if (next.idCopied && formHandedOver(next) && next.readyAt === null) {
+  if (next.idCopied && next.fileDownloaded && next.readyAt === null) {
     next.readyAt = now;
   }
   return next;
@@ -67,7 +55,6 @@ function readActions(referralId) {
       {
         idCopied: saved?.idCopied === true,
         fileDownloaded: saved?.fileDownloaded === true,
-        fileDragged: saved?.fileDragged === true,
         readyAt: typeof saved?.readyAt === "number" ? saved.readyAt : null,
       },
       {},
@@ -120,7 +107,7 @@ export function referralName(referral, fallback = "this patient") {
 /**
  * Tracks the safeguards for ONE referral:
  *   1. the LHIMS ID has been copied,
- *   2. the form has been downloaded or dragged into LHIMS,
+ *   2. the form has been downloaded,
  *   3. a 10 second countdown, started once 1 and 2 are both true, has run
  *      out (`unlocked`). Mark Done and Skip both wait for this.
  *
@@ -130,20 +117,23 @@ export function referralName(referral, fallback = "this patient") {
  * `key={referral.id}` so the state is re-read for each referral. A flag is
  * set only after its action actually succeeded.
  *
+ * `formsFolder` (see formsFolder.js) decides where the form goes: the
+ * officer's forms folder when one is set up, a normal download otherwise.
+ *
  * `reportError(message)` receives a user-facing message (or "" to clear).
  */
-export function useReferralActions(referral, reportError) {
+export function useReferralActions(referral, reportError, formsFolder) {
   const { id, patientId } = referral;
   const [actions, setActions] = useState(() => readActions(id));
   const [downloading, setDownloading] = useState(false);
 
   useEffect(() => {
-    if (actions.idCopied || formHandedOver(actions)) {
+    if (actions.idCopied || actions.fileDownloaded) {
       writeSession(ACTIONS_KEY_PREFIX + id, JSON.stringify(actions));
     }
   }, [id, actions]);
 
-  const ready = actions.idCopied && formHandedOver(actions);
+  const ready = actions.idCopied && actions.fileDownloaded;
   const secondsLeft = useUnlockCountdown(ready ? actions.readyAt : null);
 
   const copyId = async () => {
@@ -169,23 +159,18 @@ export function useReferralActions(referral, reportError) {
     reportError("");
     setDownloading(true);
     try {
-      await downloadReferralForm(referral);
+      const { notice } = await formsFolder.deliver(referral);
       const now = Date.now();
       setActions((current) =>
         withAction(current, { fileDownloaded: true }, now),
       );
+      // The form was delivered, but not where the officer expects.
+      if (notice) reportError(notice);
     } catch (downloadError) {
       reportError(downloadError.message);
     } finally {
       setDownloading(false);
     }
-  };
-
-  // Called when the browser reports that the dragged form preview was
-  // accepted by a drop target (see FormPreview).
-  const markDragged = () => {
-    const now = Date.now();
-    setActions((current) => withAction(current, { fileDragged: true }, now));
   };
 
   return {
@@ -196,7 +181,6 @@ export function useReferralActions(referral, reportError) {
     unlocked: ready && secondsLeft === 0,
     copyId,
     download,
-    markDragged,
   };
 }
 

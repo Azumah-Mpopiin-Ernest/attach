@@ -13,6 +13,8 @@ import {
   getDateKey,
 } from "../../src/referralDates";
 import Pagination from "../shared/Pagination";
+import FormsFolderBar from "./formsFolderBar";
+import { useFormsFolder } from "./formsFolder";
 import { ActiveReferralCard, SkippedReferralRow } from "./referralViews";
 import {
   clearReferralActions,
@@ -142,8 +144,8 @@ function WorkingDateBanner({ dateLabel, leftForDate, inQueue, doneCount }) {
         {dateLabel}
       </p>
       <p className="mt-2 text-sm text-slate-600">
-        Open this date's patient list in LHIMS, then work through the
-        referrals one at a time.
+        Open this date's patient list in LHIMS, then work through the referrals
+        one at a time.
       </p>
       <dl className="mt-4 grid grid-cols-3 gap-3">
         <StatTile label="Left for this date" value={leftForDate} />
@@ -166,6 +168,7 @@ export default function OfficerApp({ officerName, onSignOut }) {
   const [skippedQuery, setSkippedQuery] = useState("");
   const [skippedPage, setSkippedPage] = useState(1);
   const [doneCount, adjustDoneCount] = useSessionDoneCount(officerName);
+  const formsFolder = useFormsFolder();
 
   // Changes (completions or skips) started but not yet confirmed by the
   // server.
@@ -252,8 +255,7 @@ export default function OfficerApp({ officerName, onSignOut }) {
   const activeDateKey = activeReferral ? getDateKey(activeReferral) : null;
   const leftForDate = useMemo(
     () =>
-      queue.filter((referral) => getDateKey(referral) === activeDateKey)
-        .length,
+      queue.filter((referral) => getDateKey(referral) === activeDateKey).length,
     [queue, activeDateKey],
   );
 
@@ -291,6 +293,7 @@ export default function OfficerApp({ officerName, onSignOut }) {
     setPendingDone(null);
     setError("");
     clearReferralActions(referral.id);
+    formsFolder.removeForm(referral);
     setUnsynced((count) => count + 1);
     adjustDoneCount(1);
     completeReferral(referral.id, officerName)
@@ -309,6 +312,7 @@ export default function OfficerApp({ officerName, onSignOut }) {
     setPendingSkip(null);
     setError("");
     clearReferralActions(referral.id);
+    formsFolder.removeForm(referral);
     setUnsynced((count) => count + 1);
     updateReferral(referral.id, { status: "SKIPPED" })
       .catch((writeError) =>
@@ -325,6 +329,8 @@ export default function OfficerApp({ officerName, onSignOut }) {
         {(offline || unsynced > 0) && (
           <SyncBanner offline={offline} unsynced={unsynced} />
         )}
+
+        <FormsFolderBar formsFolder={formsFolder} />
 
         <div
           role="tablist"
@@ -373,6 +379,7 @@ export default function OfficerApp({ officerName, onSignOut }) {
                 <ActiveReferralCard
                   key={activeReferral.id}
                   referral={activeReferral}
+                  formsFolder={formsFolder}
                   onRequestDone={setPendingDone}
                   onRequestSkip={setPendingSkip}
                   onError={setError}
@@ -430,6 +437,7 @@ export default function OfficerApp({ officerName, onSignOut }) {
                     <SkippedReferralRow
                       key={referral.id}
                       referral={referral}
+                      formsFolder={formsFolder}
                       onRequestDone={setPendingDone}
                       onError={setError}
                     />
