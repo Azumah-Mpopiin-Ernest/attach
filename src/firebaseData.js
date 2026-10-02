@@ -3,6 +3,7 @@ import {
   arrayUnion,
   collection,
   deleteDoc,
+  deleteField,
   doc,
   getCountFromServer,
   getDoc,
@@ -724,6 +725,18 @@ export async function updateDocuments(collectionName, documentIds, changes) {
   } finally {
     invalidateCollection(collectionName);
   }
+}
+
+// Admin: moves already assigned (or skipped) referrals to another officer.
+// They become ASSIGNED to the new officer, in normal date order (any
+// "returned from Skipped" position is dropped).
+export function reassignReferrals(referralIds, assignedTo) {
+  return updateDocuments("referrals", referralIds, {
+    status: "ASSIGNED",
+    assignedTo,
+    assignedAt: new Date(),
+    requeuedAt: deleteField(),
+  });
 }
 
 // Puts an officer's skipped referrals back in their active queue. They carry

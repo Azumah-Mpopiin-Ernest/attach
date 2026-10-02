@@ -17,6 +17,7 @@ import ConfirmDialog from "./confirmDialog";
 import {
   getCollection,
   getReferrals,
+  reassignReferrals,
   updateDocuments,
   updateReferral,
   deleteAllReferrals,
@@ -112,12 +113,19 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
   const [deleting, setDeleting] = useState(false);
   const [deletedCount, setDeletedCount] = useState(0);
 
-  // Bulk assignment only ever applies to READY_TO_ASSIGN records, so the
-  // whole selection UI (checkboxes, the "N selected" bar, the assign
-  // dropdown) is scoped to that filter. Selecting rows on any other filter
-  // can't lead anywhere, which was the source of the "why won't this work"
-  // confusion.
-  const assignmentModeActive = statusFilter === "READY_TO_ASSIGN";
+  // The selection UI (date groups, checkboxes, the "N selected" bar, the
+  // officer dropdown) only appears where it can lead somewhere:
+  //   "assign"   Ready to assign      -> assign to an officer
+  //   "reassign" Assigned or Skipped  -> move to another officer
+  const selectionMode =
+    statusFilter === "READY_TO_ASSIGN"
+      ? "assign"
+      : statusFilter === "ASSIGNED" || statusFilter === "SKIPPED"
+        ? "reassign"
+        : null;
+  const assignmentModeActive = Boolean(selectionMode);
+  const reassignMode = selectionMode === "reassign";
+  const canSelect = reassignMode ? isReassignableReferral : isAssignableReferral;
 
   useEffect(() => {
     let active = true;
@@ -164,11 +172,11 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
     return () => exportAbort.current?.abort();
   }, []);
 
-  // Clear any stale selection when leaving Ready to assign, so switching
-  // filters back and forth never leaves a hidden selection behind.
+  // Clear any stale selection when the selection mode changes (or ends), so
+  // switching filters never leaves a hidden selection behind.
   useEffect(() => {
-    if (!assignmentModeActive) setSelectedIds([]);
-  }, [assignmentModeActive]);
+    setSelectedIds([]);
+  }, [selectionMode]);
 
   // A new filter or search starts from page 1.
   useEffect(() => {
@@ -231,9 +239,9 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
         key,
         label: formatDateLabel(key),
         referrals: items,
-        assignableIds: items.filter(isAssignableReferral).map((r) => r.id),
+        assignableIds: items.filter(canSelect).map((r) => r.id),
       }));
-  }, [filtered, assignmentModeActive]);
+  }, [filtered, assignmentModeActive, canSelect]);
 
   const allAssignableIds = useMemo(
     () => groupedByDate.flatMap((group) => group.assignableIds),
@@ -447,32 +455,33 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
       const selectedReferrals = currentReferrals.filter((referral) =>
         selectedIds.includes(referral.id),
       );
-      const assignableReferrals =
-        selectedReferrals.filter(isAssignableReferral);
+      const assignableReferrals = selectedReferrals.filter(canSelect);
       if (assignableReferrals.length !== selectedIds.length) {
         setReferrals(currentReferrals);
         setSelectedIds(assignableReferrals.map((referral) => referral.id));
         throw new Error(
-          "Only referrals signed by both doctors can be assigned.",
+          reassignMode
+            ? "Some selected referrals are no longer assigned (finished or changed meanwhile). Check the selection and try again."
+            : "Only referrals signed by both doctors can be assigned.",
         );
       }
 
-      await updateDocuments(
-        "referrals",
-        assignableReferrals.map((referral) => referral.id),
-        {
+      const ids = assignableReferrals.map((referral) => referral.id);
+      if (reassignMode) await reassignReferrals(ids, assignedTo);
+      else
+        await updateDocuments("referrals", ids, {
           status: "ASSIGNED",
           assignedTo,
           assignedAt: new Date(),
-        },
-      );
+        });
       setReferrals(await getReferrals({ force: true }));
       setSelectedIds([]);
+      const verb = reassignMode ? "reassigned" : "assigned";
       showNotice(
         "success",
         assignableReferrals.length === 1
-          ? `${assignableReferrals[0].name} was assigned to ${assignedTo}.`
-          : `${assignableReferrals.length} referrals were assigned to ${assignedTo}.`,
+          ? `${assignableReferrals[0].name} was ${verb} to ${assignedTo}.`
+          : `${assignableReferrals.length} referrals were ${verb} to ${assignedTo}.`,
       );
     } catch (assignmentError) {
       showNotice("error", assignmentError.message);
@@ -605,7 +614,9 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                   {selectedIds.length > 0 &&
                   allAssignableIds.every((id) => selectedIds.includes(id))
                     ? "Clear selection"
-                    : `Select all assignable (${allAssignableIds.length})`}
+                    : reassignMode
+                      ? `Select all (${allAssignableIds.length})`
+                      : `Select all assignable (${allAssignableIds.length})`}
                 </button>
                 <select
                   ref={assignSelectRef}
@@ -615,7 +626,7 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                     Boolean(pendingAssignment) ||
                     selectedIds.some(
                       (id) =>
-                        !isAssignableReferral(
+                        !canSelect(
                           referrals.find((referral) => referral.id === id),
                         ),
                     )
@@ -625,7 +636,11 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                   aria-label="Assign selected referrals to an officer"
                   className="min-w-0 flex-1 rounded-md border border-slate-300 px-3 py-1.5 disabled:opacity-50 sm:flex-none"
                 >
-                  <option value="">Assign selected to...</option>
+                  <option value="">
+                    {reassignMode
+                      ? "Reassign selected to..."
+                      : "Assign selected to..."}
+                  </option>
                   {officers.map((officer) => (
                     <option
                       key={officer.id}
@@ -643,7 +658,7 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                 {assigning && (
                   <span className="flex items-center gap-1.5 text-xs text-slate-500">
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    Assigning...
+                    {reassignMode ? "Reassigning..." : "Assigning..."}
                   </span>
                 )}
               </div>
@@ -652,10 +667,9 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
 
           {assignmentModeActive ? (
             <p className="mt-3 text-xs text-slate-400">
-              Grouped by the date on the form. Tick a date's checkbox to select
-              every assignable referral in it (including ones on other pages),
-              then assign the whole group to one officer in one go. Your
-              selection is kept as you move between pages.
+              {reassignMode
+                ? "Grouped by the date on the form. Tick a date's checkbox to select every referral in it (including ones on other pages), then move them all to another officer in one go. Make sure the current officer is not running an auto run on them. Your selection is kept as you move between pages."
+                : "Grouped by the date on the form. Tick a date's checkbox to select every assignable referral in it (including ones on other pages), then assign the whole group to one officer in one go. Your selection is kept as you move between pages."}
             </p>
           ) : null}
 
@@ -722,9 +736,11 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                             {onThisPage === total
                               ? `${total} referral${total === 1 ? "" : "s"}`
                               : `${onThisPage} of ${total} referrals on this page`}
-                            {group.assignableIds.length
-                              ? ` · ${group.assignableIds.length} assignable`
-                              : " · none signed by both doctors yet"}
+                            {reassignMode
+                              ? ""
+                              : group.assignableIds.length
+                                ? ` · ${group.assignableIds.length} assignable`
+                                : " · none signed by both doctors yet"}
                           </span>
                         </button>
                       </div>
@@ -742,7 +758,7 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                                   <input
                                     type="checkbox"
                                     aria-label={`Select ${r.name ?? r.patientName ?? r.patientId}`}
-                                    disabled={!isAssignableReferral(r)}
+                                    disabled={!canSelect(r)}
                                     checked={selectedIds.includes(r.id)}
                                     onChange={() => toggleSelected(r.id)}
                                     onClick={(event) => event.stopPropagation()}
@@ -758,9 +774,14 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
                                 </td>
                                 <td className="px-5 py-3">
                                   <StatusChip
-                                    status={r.status}
+                                    status={chipStatus(r.status)}
                                     officerName={r.assignedTo}
                                   />
+                                  {r.status === "SKIPPED" && (
+                                    <div className="mt-1 text-xs text-amber-700">
+                                      Skipped by the officer
+                                    </div>
+                                  )}
                                 </td>
                               </tr>
                             ))}
@@ -1080,10 +1101,14 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
         open={Boolean(pendingAssignment)}
         title={
           pendingAssignment &&
-          `Assign ${pendingAssignment.count} referral${pendingAssignment.count === 1 ? "" : "s"} to ${pendingAssignment.assignedTo}?`
+          `${reassignMode ? "Reassign" : "Assign"} ${pendingAssignment.count} referral${pendingAssignment.count === 1 ? "" : "s"} to ${pendingAssignment.assignedTo}?`
         }
-        description="They'll be able to download and attach these forms to LHIMS."
-        confirmLabel="Assign"
+        description={
+          reassignMode
+            ? "They move from their current officer's queue to this officer's queue. Make sure the current officer is not running an auto run on them right now."
+            : "They'll be able to download and attach these forms to LHIMS."
+        }
+        confirmLabel={reassignMode ? "Reassign" : "Assign"}
         onConfirm={confirmAssignment}
         onCancel={cancelAssignment}
       />
@@ -1154,6 +1179,14 @@ function formatDate(value) {
 // status is untouched; this only changes what the chip displays.
 function chipStatus(status) {
   return status === "SKIPPED" ? "ASSIGNED" : status;
+}
+
+// Already with an officer (active or skipped): can be moved to another one.
+function isReassignableReferral(referral) {
+  return (
+    (referral?.status === "ASSIGNED" || referral?.status === "SKIPPED") &&
+    Boolean(referral.assignedTo)
+  );
 }
 
 function isAssignableReferral(referral) {
