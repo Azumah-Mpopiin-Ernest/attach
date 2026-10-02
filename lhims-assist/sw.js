@@ -149,6 +149,14 @@ const publicRun = (r) =>
         skipped: r.skipped,
         stopReason: r.stopReason || null,
         concurrency: CONCURRENCY,
+        timed: r.timed || 0,
+        // average milliseconds spent in each stage per finished referral
+        timing: Object.fromEntries(
+          Object.entries(r.timing || {}).map(([k, v]) => [
+            k,
+            Math.round(v / Math.max(1, r.timed || 0)),
+          ]),
+        ),
       }
     : null;
 const poolStats = (p) => {
@@ -219,23 +227,24 @@ async function broadcast() {
         ),
       })
       .catch(() => {});
-  const tabs = await read("tabs", []);
-  const alive = [];
-  await Promise.all(
-    tabs.map(async (id) => {
-      try {
-        await chrome.tabs.sendMessage(id, {
-          channel: "TO_LHIMS",
-          type: "STATE",
-          state: publicState(jobForTab(s.jobs, id), s.breaker, s.run, s.pool),
-        });
-        alive.push(id);
-      } catch {
-        /* gone or loading */
-      }
-    }),
-  );
-  if (alive.length !== tabs.length) await store.set({ tabs: alive });
+  // Fire and forget: never wait for a tab here. A tab busy loading a heavy
+  // LHIMS page (or showing a dialog) would otherwise hold up every message,
+  // including the other jobs' progress and the app's next SUBMIT_JOB.
+  for (const id of await read("tabs", []))
+    chrome.tabs
+      .sendMessage(id, {
+        channel: "TO_LHIMS",
+        type: "STATE",
+        state: publicState(jobForTab(s.jobs, id), s.breaker, s.run, s.pool),
+      })
+      .catch(() => dropTab(id)); // gone or navigating; it says HELLO again when loaded
+}
+
+function dropTab(id) {
+  locked(async () => {
+    const tabs = await read("tabs", []);
+    if (tabs.includes(id)) await store.set({ tabs: tabs.filter((t) => t !== id) });
+  });
 }
 
 // ---------- per-job watchdog ----------
@@ -291,12 +300,28 @@ async function transition(jobId, stage, patch = {}, force = false) {
     next.warn = null;
   jobs[jobId] = next;
   await store.set({ jobs });
+  if (job.auto) await recordTiming(job, next);
   if (TERMINAL.has(stage)) {
     await onTerminal(next);
     await afterTerminal(next);
   } else await arm(next);
   await broadcast();
   return next;
+}
+
+// Time spent in the stage just left, summed per run (shown as averages in the app).
+async function recordTiming(prev, next) {
+  const run = await read("run");
+  if (!ACTIVE(run)) return;
+  const timing = { ...(run.timing || {}) };
+  timing[prev.stage] = (timing[prev.stage] || 0) + (next.updatedAt - prev.updatedAt);
+  await store.set({
+    run: {
+      ...run,
+      timing,
+      timed: (run.timed || 0) + (TERMINAL.has(next.stage) ? 1 : 0),
+    },
+  });
 }
 
 // ---------- auto-run: tab pool ----------
@@ -585,6 +610,8 @@ async function startRun(p, sender, breaker, run) {
       skipped: 0,
       problems: 0,
       submitted: 0,
+      timing: {},
+      timed: 0,
       stopReason: null,
       startedAt: Date.now(),
     },

@@ -66,6 +66,7 @@ export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
   const submitted = useRef(new Map()); // referral id -> LHIMS date, sent during this run
   const prebuilt = useRef(new Map()); // referral id -> Promise<job>
   const busy = useRef(false);
+  const sendFailures = useRef(0); // consecutive failed sends; a few in a row stop the run
   useEffect(() => {
     queueRef.current = queue;
     actionsRef.current = { markDone, skipReferral };
@@ -220,6 +221,7 @@ export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
         }
         prebuilt.current.delete(next.id);
         const res = await request("SUBMIT_JOB", { ...job, date }, 20000);
+        sendFailures.current = 0;
         if (res.ok) return;
         submitted.current.delete(next.id);
         if (res.error === "RUN_STOPPING") return;
@@ -236,9 +238,15 @@ export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
           return;
         }
         await stop(res.error);
-      } catch {
+      } catch (error) {
+        // Usually the extension was slow to answer. It ignores a resend of a
+        // referral it already has, so retry before giving up.
         submitted.current.delete(next.id);
-        await stop("APP_ERROR");
+        sendFailures.current += 1;
+        if (sendFailures.current >= 3) {
+          sendFailures.current = 0;
+          await stop(`APP_ERROR: ${error?.message || "unknown"}`.slice(0, 40));
+        }
       } finally {
         busy.current = false;
         if (retrigger) setTick((t) => t + 1);

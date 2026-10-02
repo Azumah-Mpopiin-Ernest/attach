@@ -17,6 +17,24 @@ const STOP_TEXT = {
   BAD_DATE: "Stopped: a referral has a date the extension cannot use.",
 };
 
+// Where the time goes, per finished referral (stages reported by the extension).
+const STEPS = [
+  ["Waiting for a tab", ["JOB_RECEIVED"]],
+  ["Finding patient", ["TAB_CLAIMED", "SEARCHING"]],
+  ["Opening visit", ["MATCHED"]],
+  ["Filling form", ["ON_ATTACHMENT_PAGE", "FILE_ATTACHED", "NOTE_FILLED", "TYPE_SET"]],
+  ["Saving", ["READY_FOR_SAVE", "SAVE_CLICKED"]],
+];
+
+function timingLine(run) {
+  if (!run?.timed || !run.timing) return null;
+  const secs = (stages) =>
+    stages.reduce((sum, s) => sum + (run.timing[s] || 0), 0) / 1000;
+  const total = Object.values(run.timing).reduce((a, b) => a + b, 0) / 1000;
+  const parts = STEPS.map(([label, stages]) => `${label} ${secs(stages).toFixed(1)}s`);
+  return `Average per referral ${total.toFixed(1)}s: ${parts.join(" · ")}`;
+}
+
 export default function LhimsRunBar({ lhims }) {
   const {
     present,
@@ -64,6 +82,9 @@ export default function LhimsRunBar({ lhims }) {
               Done {run.done} · skipped {run.skipped}. Open the Skipped
               Referrals tab to review why.
             </p>
+          )}
+          {timingLine(run) && (
+            <p className="mt-0.5 text-xs opacity-80">{timingLine(run)}</p>
           )}
           {startError && (
             <p role="alert" className="mt-1 text-rose-700">
