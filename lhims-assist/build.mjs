@@ -17,7 +17,7 @@ const appMatches = C.APP_ORIGINS.map((o) => {
 const manifest = {
   manifest_version: 3,
   name: "LHIMS Referral Assist",
-  version: "0.4.3",
+  version: "0.4.4",
   description:
     "Assists and automates attaching referral forms in LHIMS. Local only.",
   minimum_chrome_version: "120",

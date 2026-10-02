@@ -193,6 +193,18 @@
     const box = dateBox();
     return box ? box.value.trim() : null;
   }
+  // LHIMS fills the page in after it loads, so the header/date box can show
+  // the previous date for a moment. Wait for it to settle on `want` before
+  // judging; resolves with the date finally shown.
+  const DATE_SETTLE_MS = C.DATE_SETTLE_MS ?? 8000;
+  async function settledDate(want) {
+    if (!want) return pageDate();
+    await waitUntil(() => {
+      const shown = pageDate();
+      return !shown || shown === want;
+    }, DATE_SETTLE_MS);
+    return pageDate();
+  }
   let switchTried = false;
   // Ask LHIMS for another date the way a person does: type it into the
   // page's date box and press Enter. If the page reloads, it says HELLO again.
@@ -428,7 +440,8 @@
 
   async function doSearch(job) {
     // never search a list for a different date than the referral's
-    const shown = pageDate();
+    const shown = await settledDate(job.date);
+    guard();
     if (job.date && shown && shown !== job.date)
       throw new Problem(
         "NEEDS_ATTENTION",
@@ -971,11 +984,12 @@
     try {
       const kind = pageKind();
       if (kind === "LIST") await loaded();
+      const shown = kind === "LIST" ? await settledDate(listDate()) : null;
       const r = await sw({
         type: "HELLO",
         page: kind,
         date: listDate(),
-        shown: kind === "LIST" ? pageDate() : null,
+        shown,
         ready: kind === "LIST" && listReady(),
       });
       if (!r?.ok) return;
