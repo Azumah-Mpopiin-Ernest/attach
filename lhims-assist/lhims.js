@@ -168,6 +168,48 @@
             ? "FILTER"
             : "OTHER";
   };
+  // The date the list page really shows. LHIMS keeps the date chosen with
+  // "Filter & Lock" for the session and can ignore the date in the address,
+  // so the address alone cannot be trusted. Read from the day header
+  // ("Tuesday 07-Jul-2026"), else from the date box ("07-07-2026"). DD-MM-YYYY.
+  const MONTHS = {
+    JAN: "01", FEB: "02", MAR: "03", APR: "04", MAY: "05", JUN: "06",
+    JUL: "07", AUG: "08", SEP: "09", OCT: "10", NOV: "11", DEC: "12",
+  };
+  const DATE_BOX = /^\d{2}-\d{2}-\d{4}$/;
+  const dateBox = () => vis("input").find((i) => DATE_BOX.test(i.value.trim()));
+  const DAY_HEADER =
+    /(?:MON|TUES|WEDNES|THURS|FRI|SATUR|SUN)DAY,?\s+(\d{1,2})[-\s]([A-Z]{3})[A-Z]*[-\s,]+(\d{4})/i;
+  function pageDate() {
+    // nearest the visit list first, then the whole page
+    const grid = document.querySelector(S.list.grid);
+    const scopes = [grid?.parentElement?.parentElement, document.body];
+    for (const el of scopes) {
+      if (!el) continue;
+      const m = ((el.innerText ?? el.textContent) || "").match(DAY_HEADER);
+      const mm = m && MONTHS[m[2].toUpperCase()];
+      if (mm) return `${m[1].padStart(2, "0")}-${mm}-${m[3]}`;
+    }
+    const box = dateBox();
+    return box ? box.value.trim() : null;
+  }
+  let switchTried = false;
+  // Ask LHIMS for another date the way a person does: type it into the
+  // page's date box and press Enter. If the page reloads, it says HELLO again.
+  function trySwitchDate(target) {
+    if (switchTried) return;
+    switchTried = true;
+    const box = dateBox();
+    if (!box) return;
+    dbg("switching list date", box.value, "->", target);
+    box.focus();
+    setNative(box, target);
+    for (const t of ["keydown", "keypress", "keyup"])
+      box.dispatchEvent(
+        new KeyboardEvent(t, { bubbles: true, key: "Enter", keyCode: 13, which: 13 }),
+      );
+    fire(box, "blur");
+  }
   const listDate = () =>
     new URL(location.href).searchParams.get("dScheduleDate");
   const isLoggedOut = () =>
@@ -385,6 +427,14 @@
   }
 
   async function doSearch(job) {
+    // never search a list for a different date than the referral's
+    const shown = pageDate();
+    if (job.date && shown && shown !== job.date)
+      throw new Problem(
+        "NEEDS_ATTENTION",
+        "WRONG_DATE",
+        `LHIMS shows ${shown}, referral is ${job.date}`,
+      );
     await progress("SEARCHING");
     const sel = document.querySelector(S.list.patientSelect);
     if (!sel) throw new Problem("NEEDS_ATTENTION", "SELECTOR_patientSelect_0");
@@ -925,6 +975,7 @@
         type: "HELLO",
         page: kind,
         date: listDate(),
+        shown: kind === "LIST" ? pageDate() : null,
         ready: kind === "LIST" && listReady(),
       });
       if (!r?.ok) return;
@@ -932,6 +983,7 @@
       state = r.state;
       aborted = TERMINAL.has(state.stage);
       Badge.render(state, ctx());
+      if (r.switchDate) trySwitchDate(r.switchDate); // this list shows the wrong date
       if (r.job && !TERMINAL.has(state.stage)) resume(r.job);
     } catch (e) {
       handleError(e);

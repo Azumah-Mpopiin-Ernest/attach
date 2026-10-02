@@ -17,6 +17,9 @@ const HARD_STOPS = new Set(["LOGGED_OUT", "EXTENSION_ERROR"]);
 // Nothing left to attach: the visit already has the form, or every matching visit is red/green.
 // Marked done instead of skipped (keep in sync with MARK_DONE in lhims-assist/sw.js).
 const MARK_DONE = new Set(["ALREADY_ATTACHED", "NO_USABLE_ROW"]);
+// Not the referral's fault (the LHIMS tab showed another date): send it again
+// (keep in sync with RETRY in lhims-assist/sw.js).
+const RETRY = new Set(["WRONG_DATE"]);
 const BAD_DATA = new Set(["BAD_PATIENT_ID", "BAD_FILE_NAME"]); // this referral cannot be automated: skip it, keep going
 const START_ERRORS = {
   NO_START_REQUEST:
@@ -65,6 +68,7 @@ export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
   const processed = useRef(new Set()); // referral ids with a final outcome
   const submitted = useRef(new Map()); // referral id -> LHIMS date, sent during this run
   const prebuilt = useRef(new Map()); // referral id -> Promise<job>
+  const handled = useRef(new Set()); // extension job ids whose outcome was applied
   const busy = useRef(false);
   const sendFailures = useRef(0); // consecutive failed sends; a few in a row stop the run
   useEffect(() => {
@@ -142,9 +146,15 @@ export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
         !job.auto ||
         !id ||
         processed.current.has(id) ||
-        !TERMINAL.has(job.stage)
+        !TERMINAL.has(job.stage) ||
+        handled.current.has(job.jobId)
       )
         continue;
+      handled.current.add(job.jobId);
+      if (job.stage === "NEEDS_ATTENTION" && RETRY.has(job.reason)) {
+        submitted.current.delete(id); // goes back to waiting; sent again with retry
+        continue;
+      }
       const referral = queueRef.current.find((r) => r.id === id);
       if (!referral) continue;
       if (
@@ -175,10 +185,14 @@ export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
     if (!present || !queueLoaded || !running || busy.current) return;
 
     const stop = (reason) => request("RUN_STOP", { reason }).catch(() => {});
-    // a finished job frees its slot even if its referral left the queue meanwhile
+    // a finished job frees its slot even if its referral left the queue
+    // meanwhile (only each referral's newest job counts: `jobs` is newest first)
+    const newest = new Map();
+    for (const j of ext.jobs ?? [])
+      if (j.auto && !newest.has(j.referralId)) newest.set(j.referralId, j);
     const finished = new Set(
-      (ext.jobs ?? [])
-        .filter((j) => j.auto && TERMINAL.has(j.stage))
+      [...newest.values()]
+        .filter((j) => TERMINAL.has(j.stage) && !RETRY.has(j.reason))
         .map((j) => j.referralId),
     );
     const inFlight = [...submitted.current].filter(
@@ -220,7 +234,12 @@ export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
           return;
         }
         prebuilt.current.delete(next.id);
-        const res = await request("SUBMIT_JOB", { ...job, date }, 20000);
+        // retry: a referral sent back by RETRY must get a fresh extension job
+        const res = await request(
+          "SUBMIT_JOB",
+          { ...job, date, retry: true },
+          20000,
+        );
         sendFailures.current = 0;
         if (res.ok) return;
         submitted.current.delete(next.id);

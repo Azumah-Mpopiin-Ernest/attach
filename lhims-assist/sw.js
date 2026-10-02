@@ -31,6 +31,8 @@ const NO_BREAKER = new Set([
 ]);
 // Outcomes the app marks done instead of skipping (keep in sync with src/lhims/useLhimsRun.js).
 const MARK_DONE = new Set(["ALREADY_ATTACHED", "NO_USABLE_ROW"]);
+// Not the referral's fault: the app sends it again (keep in sync with src/lhims/useLhimsRun.js).
+const RETRY = new Set(["WRONG_DATE"]);
 const PATCH_KEYS = [
   "reason",
   "scheduleId",
@@ -105,8 +107,11 @@ const readJobs = () => read("jobs", {});
 const isLive = (j) => !TERMINAL.has(j.stage);
 const liveAuto = (jobs) =>
   Object.values(jobs).filter((j) => j.auto && isLive(j));
+// newest first; `seq` (creation order) breaks ties within the same millisecond
 const newestFirst = (list) =>
-  [...list].sort((a, b) => b.updatedAt - a.updatedAt);
+  [...list].sort(
+    (a, b) => b.updatedAt - a.updatedAt || (b.seq || 0) - (a.seq || 0),
+  );
 const manualJob = (jobs) =>
   newestFirst(Object.values(jobs).filter((j) => !j.auto))[0] || null;
 const liveJobOfTab = (jobs, tabId) =>
@@ -161,9 +166,15 @@ const publicRun = (r) =>
     : null;
 const poolStats = (p) => {
   const v = Object.values(p || {});
-  return { total: v.length, ready: v.filter((x) => x.ready).length };
+  return {
+    total: v.length,
+    ready: v.filter((x) => x.ready).length,
+    // a list tab showing another date than the run needs (see HELLO)
+    wrongDate: v.find((x) => x.wrongDate)?.wrongDate || null,
+  };
 };
 const publicJob = (job) => ({
+  jobId: job.jobId,
   referralId: job.referralId,
   stage: job.stage,
   reason: job.reason || null,
@@ -341,7 +352,9 @@ async function poolFill() {
     } catch {
       continue;
     } // tab is gone
-    if (!inUse.has(Number(id)) && p.date !== run.date) {
+    // reload tabs opened for another date, and tabs whose page showed the
+    // wrong date (once LHIMS is switched, a reload picks up the right one)
+    if (!inUse.has(Number(id)) && (p.date !== run.date || p.wrongDate)) {
       pool[id] = { date: run.date, ready: false };
       chrome.tabs
         .update(Number(id), { url: listUrl(run, run.date) })
@@ -420,6 +433,15 @@ async function afterTerminal(job) {
   const run = await read("run");
   if (!job.auto || !ACTIVE(run)) return;
   if (HARD_STOP.has(job.stage)) return stopRun(job.reason || job.stage, true); // referral stays in the queue
+  if (job.stage === "NEEDS_ATTENTION" && RETRY.has(job.reason)) {
+    // nothing happened to this referral: no counts, the app sends it again
+    if (run.status === "STOPPING") {
+      if (!liveAuto(await readJobs()).length)
+        await finishRun(run.stopReason || "OFFICER_STOP", !!run.keepPool);
+      return;
+    }
+    return recycle(job.claimedTabId, run);
+  }
   const done =
     job.stage === "VERIFIED" ||
     (job.stage === "NEEDS_ATTENTION" && MARK_DONE.has(job.reason));
@@ -560,8 +582,11 @@ async function submit(p, breaker) {
     verifyBytes = n < VERIFY_BYTES_FIRST || n % VERIFY_BYTES_EVERY === 0;
     run = { ...run, submitted: n + 1 };
   }
+  const seq = (await read("seq", 0)) + 1;
+  await store.set({ seq });
   const next = {
     jobId: crypto.randomUUID(),
+    seq,
     referralId: p.referralId,
     patientId: p.patientId.trim(),
     expectedFileName: p.expectedFileName,
@@ -682,6 +707,7 @@ async function onLhims(msg, sender) {
       await store.set({ tabs: [...tabs] });
       const pool = await read("pool", {});
       const p = pool[tabId];
+      let switchDate = null;
       if (
         p &&
         !p.busy &&
@@ -690,13 +716,20 @@ async function onLhims(msg, sender) {
         msg.date === p.date &&
         ACTIVE(run)
       ) {
-        pool[tabId] = { ...p, ready: true };
+        // Ready only if the page really shows the run's date: LHIMS can keep
+        // a date locked for the session and ignore the one in the address.
+        const wrong = msg.shown && msg.shown !== p.date ? msg.shown : null;
+        pool[tabId] = { ...p, ready: !wrong, wrongDate: wrong };
         await store.set({ pool });
-        await assign();
+        if (wrong) switchDate = p.date;
+        else await assign();
+        if (!wrong && Object.values(pool).some((x) => x.wrongDate))
+          await poolFill(); // the date is right now: reload tabs that showed the old one
       }
       return {
         ok: true,
         tabId,
+        ...(switchDate ? { switchDate } : {}),
         ...(await view(jobForTab(await readJobs(), tabId))),
       };
     }
@@ -832,8 +865,11 @@ chrome.alarms.onAlarm.addListener((a) => {
             j.stage === "JOB_RECEIVED" &&
             Date.now() - j.updatedAt > A.READY_TAB_TIMEOUT_MIN * 60000,
         )
-      )
-        return stopRun("NO_READY_TAB", true);
+      ) {
+        const pool = await read("pool", {});
+        const wrong = Object.values(pool).some((x) => x.wrongDate);
+        return stopRun(wrong ? "WRONG_DATE" : "NO_READY_TAB", true);
+      }
       await poolFill();
       await assign();
     });

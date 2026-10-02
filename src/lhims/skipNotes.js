@@ -13,6 +13,7 @@ const TEXT = {
   MISMATCH:
     "The visit that opened did not match the one chosen from the list. Nothing was saved.",
   TIMEOUT: "LHIMS took too long to respond.",
+  WRONG_DATE: "LHIMS was showing a different date than this referral's.",
   TAB_CLOSED: "The LHIMS tab was closed during the attempt.",
   UNEXPECTED_DIALOG: "LHIMS showed a message the extension did not expect.",
   SELECTOR: "A part of the LHIMS page was not found as expected.",

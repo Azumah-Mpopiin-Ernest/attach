@@ -6,6 +6,8 @@ const STOP_TEXT = {
   NO_READY_TAB:
     "No LHIMS list tab became ready. Check that the tabs open the patient list, then start again.",
   APP_CLOSED: "The app tab was closed, so the run stopped.",
+  WRONG_DATE:
+    "Stopped: LHIMS kept showing a different date than the referrals'. In LHIMS open Filter Selection, choose the date shown in your queue, press Filter & Lock, then start again.",
   LOGGED_OUT:
     "Stopped: LHIMS is logged out. Log in and start again. The referral it was on is still in your queue.",
   EXTENSION_ERROR:
@@ -81,6 +83,14 @@ export default function LhimsRunBar({ lhims }) {
             <p className="mt-0.5">
               Done {run.done} · skipped {run.skipped}. Open the Skipped
               Referrals tab to review why.
+            </p>
+          )}
+          {active && pool?.wrongDate && (
+            <p role="alert" className="mt-1 font-medium text-amber-800">
+              LHIMS is showing {pool.wrongDate}, but these referrals are for{" "}
+              {run.date}. The extension is trying to switch the date. If it
+              does not within a minute: in LHIMS open Filter Selection, choose{" "}
+              {run.date} and press Filter &amp; Lock.
             </p>
           )}
           {timingLine(run) && (
