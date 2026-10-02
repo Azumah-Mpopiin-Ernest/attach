@@ -56,6 +56,17 @@ function sortByDate(referrals) {
   );
 }
 
+// Latest form date first (skipped list); referrals with no date stay last.
+function sortByDateDescending(referrals) {
+  return [...referrals].sort((a, b) => {
+    const left = getDateKey(a);
+    const right = getDateKey(b);
+    if (left === "unknown" || right === "unknown")
+      return compareDateKeys(left, right);
+    return compareDateKeys(right, left);
+  });
+}
+
 function doneDescription(referral) {
   if (!referral) return "";
   return `Confirm that ${referralName(referral)}'s form (LHIMS ID ${referral.patientId ?? "unknown"}) has been attached in LHIMS. The referral will be permanently removed from the system and can't be undone.`;
@@ -254,7 +265,10 @@ export default function OfficerApp({ officerName, onSignOut }) {
   }, [assigned, skipped, offline]);
 
   const queue = useMemo(() => sortByDate(assigned), [assigned]);
-  const skippedQueue = useMemo(() => sortByDate(skipped), [skipped]);
+  const skippedQueue = useMemo(
+    () => sortByDateDescending(skipped),
+    [skipped],
+  );
 
   // The referral on screen is PINNED by id: a referral that arrives or is
   // reassigned mid-task can't swap the card out from under the officer. It

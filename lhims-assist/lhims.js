@@ -38,11 +38,9 @@
     armedFor = null,
     activeJob = null;
 
-  // How long to wait for the patient to show up (dropdown, then results) before
-  // calling it NO_MATCH. A freshly recycled list tab can report "ready" before
-  // LHIMS has finished filling the dropdown/grid, so a single instant check
-  // produced false NO_MATCHes that grew as more tabs were recycled.
-  const MATCH_WAIT_MS = C.MATCH_WAIT_MS ?? 15000;
+  // After a Search click reloads the list (the rare fallback), how long to wait
+  // for the patient's rows before calling it NO_MATCH.
+  const MATCH_WAIT_MS = C.MATCH_WAIT_MS ?? 8000;
 
   class Problem extends Error {
     constructor(stage, reason, detail = null) {
@@ -280,64 +278,183 @@
     return "other";
   }
 
-  // ---------- steps 1-3: search, pick the right visit, open attachment page ----------
+  // ---------- steps 1-3: find the patient, pick the right visit, open attachment page ----------
+  // The list page already shows every visit for the date, so the patient's
+  // rows are normally read straight from it: no dropdown, no Search click and
+  // no page reload. Only if they are not shown does it search like a person
+  // (pick from the dropdown, or paste the ID into its search box), and only
+  // as a last resort click Search, which reloads the page.
+  const FILTER_WAIT_MS = C.FILTER_WAIT_MS ?? 2500; // the dropdown filters in the page, no network
+  const LIST_LOAD_MS = C.LIST_LOAD_MS ?? 10000; // a fresh list page may still be filling in
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // quietFor with a ceiling: a page with a live clock is never fully quiet
+  const settle = (root, ms) => Promise.race([quietFor(root, ms), sleep(ms * 4)]);
+  const escRe = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // the ID as a whole token, e.g. "FRANCISCA SAAH (BE-A01-AAC9504)"
+  const hasId = (text, want) =>
+    new RegExp(`(^|[^A-Z0-9-])${escRe(want)}([^A-Z0-9-]|$)`).test(norm(text));
+  const mask = (t) =>
+    (t || "")
+      .trim()
+      .replace(/[A-Za-z]/g, "a")
+      .replace(/\d/g, "9")
+      .slice(0, 24);
+
+  let leaving = false; // the page is navigating away: stop acting on it
+  addEventListener("beforeunload", () => {
+    leaving = true;
+  });
+  const stillHere = () => {
+    guard();
+    if (leaving) throw new Error("ABORTED"); // the next page carries on
+  };
+
+  const gridEl = () => document.querySelector(S.list.grid);
+  const visitsOf = (want) => {
+    const grid = gridEl();
+    const f = grid
+      ? vis(S.list.patientLink, grid).filter(
+          (a) => norm(a.dataset.patientNo) === want,
+        )
+      : [];
+    return f.length ? f : null;
+  };
+
+  // A freshly loaded list may still be filling in: wait for content, then a short quiet spell.
+  async function listSettled(sel) {
+    await waitUntil(
+      () =>
+        (gridEl() && all(S.list.patientLink, gridEl()).length > 0) ||
+        sel.options.length > 1,
+      LIST_LOAD_MS,
+    );
+    if (gridEl()) await settle(gridEl(), 400);
+  }
+
+  // Search like a person: open the dropdown, paste the ID, click the patient that appears.
+  const WIDGET_INPUTS =
+    ".select2-search__field, .select2-search input, .select2-input, .chosen-search input, .chosen-container input[type='text']";
+  const WIDGET_ITEMS =
+    ".select2-results__option, .select2-result, .chosen-results li, .ui-menu-item";
+  const press = (el) =>
+    ["mouseover", "mousemove", "mousedown", "mouseup", "click"].forEach((t) =>
+      el.dispatchEvent(
+        new MouseEvent(t, { bubbles: true, cancelable: true, view: window }),
+      ),
+    );
+  const widgetOf = (sel) =>
+    (sel.id &&
+      (document.getElementById(`s2id_${sel.id}`) ||
+        document.getElementById(`${sel.id}_chosen`))) ||
+    sel.parentElement?.querySelector(
+      ".select2-container, .select2, .chosen-container",
+    ) ||
+    null;
+  async function typedSearch(sel, job, want) {
+    const widget = widgetOf(sel);
+    if (!widget) return { ok: false, detail: "no search box" };
+    press(
+      widget.querySelector(
+        ".select2-selection, .select2-choice, .chosen-single",
+      ) || widget,
+    );
+    const input = await waitUntil(
+      () =>
+        vis(WIDGET_INPUTS)[0] || vis("input:not([type='hidden'])", widget)[0],
+      1500,
+    );
+    if (!input) return { ok: false, detail: "search box did not open" };
+    input.focus();
+    setNative(input, job.patientId);
+    ["keydown", "keyup"].forEach((t) =>
+      input.dispatchEvent(new KeyboardEvent(t, { bubbles: true, key: "0" })),
+    );
+    const item = await waitUntil(
+      () => vis(WIDGET_ITEMS).find((li) => hasId(li.textContent, want)),
+      FILTER_WAIT_MS,
+    );
+    if (!item) {
+      const n = vis(WIDGET_ITEMS).length;
+      input.dispatchEvent(
+        new KeyboardEvent("keydown", { bubbles: true, key: "Escape" }),
+      );
+      return { ok: false, detail: `typed: ${n} results` };
+    }
+    press(item);
+    return { ok: true };
+  }
+
   async function doSearch(job) {
     await progress("SEARCHING");
     const sel = document.querySelector(S.list.patientSelect);
     if (!sel) throw new Problem("NEEDS_ATTENTION", "SELECTOR_patientSelect_0");
+    if (!gridEl()) throw new Problem("NEEDS_ATTENTION", "SELECTOR_grid_0");
     const want = norm(job.patientId);
-    const matching = () => {
-      const m = [...sel.options].filter((o) => {
-        const id = o.text.match(/\(([^()]+)\)\s*$/);
-        return id && norm(id[1]) === want;
-      });
-      return m.length ? m : null;
-    };
-    const opts = await waitUntil(matching, MATCH_WAIT_MS);
-    guard();
-    if (!opts)
+    await listSettled(sel);
+    stillHere();
+
+    // 1) fastest: the patient's visits are already listed
+    let found = visitsOf(want);
+
+    // 2) pick the patient in the dropdown (it filters the list in the page)
+    let tried = "";
+    if (!found) {
+      const opt = [...sel.options].find(
+        (o) => o.value && (hasId(o.text, want) || hasId(o.value, want)),
+      );
+      if (opt) {
+        setNative(sel, opt.value);
+        found = await waitUntil(() => visitsOf(want), FILTER_WAIT_MS);
+        tried = "picked";
+      } else {
+        // 3) paste the ID into the dropdown's search box and click the result
+        const typed = await typedSearch(sel, job, want);
+        tried = typed.detail || "typed";
+        if (typed.ok)
+          found = await waitUntil(() => visitsOf(want), FILTER_WAIT_MS);
+      }
+      stillHere();
+    }
+
+    if (!found) {
+      // 4) last resort: the Search button, which reloads the page
+      if (sel.value && (tried === "picked" || tried === "typed")) {
+        const btn = one("searchButton", S.list.searchButton);
+        await progress("SEARCHING", { searchClicked: true }); // persisted before the click: the page reloads
+        leaving = true; // never act on this page again
+        btn.click();
+        return;
+      }
+      const sample = [...sel.options].find((o) => o.value)?.text;
       throw new Problem(
         "NEEDS_ATTENTION",
         "NO_MATCH",
-        `not in dropdown (${sel.options.length} options)`,
+        `${sel.options.length} options (e.g. ${mask(sample)}); ${tried}`,
       );
-    setNative(sel, opts[0].value); // duplicates in the dropdown: the first one is used
-    if (sel.value !== opts[0].value)
-      throw new Problem("NEEDS_ATTENTION", "SELECT_NOT_SET");
-    const btn = one("searchButton", S.list.searchButton);
-    await progress("SEARCHING", { searchClicked: true }); // persisted before the click: the page may reload
-    btn.click();
-    return evaluateResults(job);
+    }
+    await settle(gridEl(), 300); // let the rest of this patient's rows render
+    stillHere();
+    return pickVisit(job, visitsOf(want) || found);
   }
 
+  // After a Search reload: read the results on the new page.
   async function evaluateResults(job) {
-    const grid = document.querySelector(S.list.grid);
-    if (!grid) throw new Problem("NEEDS_ATTENTION", "SELECTOR_grid_0");
+    if (!gridEl()) throw new Problem("NEEDS_ATTENTION", "SELECTOR_grid_0");
     const want = norm(job.patientId);
-    await new Promise((r) => setTimeout(r, 300));
-    await quietFor(grid, C.SETTLE_MS); // always: all result rows must be rendered before one is chosen
-    guard();
-
-    // re-query the grid each time: a search may replace the grid element
-    const currentGrid = () => document.querySelector(S.list.grid) || grid;
-    const matching = () => {
-      const f = vis(S.list.patientLink, currentGrid()).filter(
-        (a) => norm(a.dataset.patientNo) === want,
-      );
-      return f.length ? f : null;
-    };
-    // the results may still be loading when the grid first goes quiet
-    const hit = await waitUntil(matching, MATCH_WAIT_MS);
-    guard();
+    const hit = await waitUntil(() => visitsOf(want), MATCH_WAIT_MS);
+    stillHere();
     if (!hit)
       throw new Problem(
         "NEEDS_ATTENTION",
         "NO_MATCH",
-        `not in results (${vis(S.list.patientLink, currentGrid()).length} rows shown)`,
+        `not in results (${vis(S.list.patientLink, gridEl()).length} rows shown)`,
       );
-    await quietFor(currentGrid(), C.SETTLE_MS); // let the rest of this patient's rows render too
-    guard();
-    const found = matching() || hit;
+    await settle(gridEl(), 300);
+    stillHere();
+    return pickVisit(job, visitsOf(want) || hit);
+  }
+
+  async function pickVisit(job, found) {
     const rows = found
       .map((a) => {
         const block = a.closest(S.list.rowBlock);
@@ -376,10 +493,12 @@
       /fUpdateSchedule\(\s*(\d+)/,
     )?.[1];
     if (!sid) throw new Problem("NEEDS_ATTENTION", "SCHEDULE_ID_UNREADABLE");
+    stillHere();
     await progress("MATCHED", {
       scheduleId: sid,
       ...(how ? { warn: how } : {}),
     });
+    leaving = true; // the click navigates to the attachment page
     icon.click(); // same-tab navigation; in auto mode the update confirmation is accepted by dialogs.js
   }
 
@@ -447,6 +566,8 @@
     if (hid && hid.value !== String(job.scheduleId))
       throw new Problem("MISMATCH", "SCHEDULE_ID_MISMATCH_FORM");
     await progress("ON_ATTACHMENT_PAGE");
+    // read-only request for the attachment count; runs while the form is filled
+    const baselineP = captureBaseline(job);
 
     await waitFor(
       () =>
@@ -509,7 +630,7 @@
 
     if (!readback().ok)
       throw new Problem("NEEDS_ATTENTION", "FINAL_READBACK_FAILED");
-    const baseline = await captureBaseline(job);
+    const baseline = await baselineP;
     guard();
     if (job.auto && baseline == null)
       throw new Problem("NEEDS_ATTENTION", "NO_BASELINE"); // never save what cannot be verified
@@ -668,6 +789,9 @@
       if (st === "TAB_CLAIMED" || (st === "SEARCHING" && !job.searchClicked))
         return doSearch(job);
       if (st === "SEARCHING") return evaluateResults(job); // page reloaded after the search click
+      // back on the list before reaching the attachment page (the visit click
+      // was cut short by a reload): nothing was saved, so find the visit again
+      if (st === "MATCHED") return doSearch(job);
       if (st === "SAVE_CLICKED")
         throw new Problem("UNVERIFIED", "NAVIGATED_AWAY_AFTER_SAVE");
       throw new Problem("NEEDS_ATTENTION", "UNEXPECTED_PAGE");
