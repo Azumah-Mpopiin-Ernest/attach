@@ -364,10 +364,8 @@ async function drawSignature(
   );
   context.globalAlpha = 1;
   context.restore();
-
-  // Free the temporary bitmap immediately (matters in large batches).
-  signatureCanvas.width = 0;
-  signatureCanvas.height = 0;
+  // signatureCanvas is shared by every form with this signature (see
+  // inkedSignature): never free or resize it here.
 }
 
 // The cropped, ink-coloured signature depends only on the image, so it is
