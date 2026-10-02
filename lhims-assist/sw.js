@@ -33,7 +33,23 @@ const NO_BREAKER = new Set([
 const MARK_DONE = new Set(["ALREADY_ATTACHED", "NO_USABLE_ROW"]);
 // Not the referral's fault: the app sends it again (keep in sync with src/lhims/useLhimsRun.js).
 const RETRY = new Set(["WRONG_DATE"]);
+// Auto runs: list tabs only find patients and stay loaded; each referral's
+// attachment page opens in a separate work tab (no list reload per referral).
+const WORK_TABS = A.SEPARATE_WORK_TABS !== false;
+// A job that ends on its list tab in one of these leaves the list as it was: keep it loaded.
+const KEEP_LIST = new Set(["NO_MATCH", "NO_USABLE_ROW"]);
+// fUpdateSchedule's flag parameters, in order, after iScheduleID
+const VISIT_FLAGS = [
+  "iScheduleCalanderForDialysis",
+  "iScheduleCalanderForAccidentEmergency",
+  "iScheduleCalanderForOncology",
+  "iScheduleCalanderForPediatric",
+  "iScheduleCalanderForANC",
+  "iScheduleCalanderForSurgery",
+  "iScheduleCalanderForRadiology",
+];
 const PATCH_KEYS = [
+  "visitFlags",
   "reason",
   "scheduleId",
   "searchClicked",
@@ -164,8 +180,9 @@ const publicRun = (r) =>
         ),
       }
     : null;
+const isWork = (p) => p?.kind === "work";
 const poolStats = (p) => {
-  const v = Object.values(p || {});
+  const v = Object.values(p || {}).filter((x) => !isWork(x)); // list tabs
   return {
     total: v.length,
     ready: v.filter((x) => x.ready).length,
@@ -405,16 +422,21 @@ async function poolFill() {
     } catch {
       continue;
     } // tab is gone
-    // reload tabs opened for another date, and tabs whose page showed the
-    // wrong date (once LHIMS is switched, a reload picks up the right one)
-    if (!inUse.has(Number(id)) && (p.date !== run.date || p.wrongDate)) {
+    // reload list tabs opened for another date, and tabs whose page showed
+    // the wrong date (once LHIMS is switched, a reload picks up the right one)
+    if (isWork(p)) pool[id] = p;
+    else if (!inUse.has(Number(id)) && (p.date !== run.date || p.wrongDate)) {
       pool[id] = { date: run.date, ready: false };
       chrome.tabs
         .update(Number(id), { url: listUrl(run, run.date) })
         .catch(() => {});
     } else pool[id] = p;
   }
-  while (Object.keys(pool).length < A.POOL_SIZE) {
+  // POOL_SIZE = list tabs (work tabs are opened as referrals need them)
+  while (
+    Object.values(pool).filter((p) => !isWork(p)).length <
+    (WORK_TABS ? A.LIST_TABS ?? A.POOL_SIZE : A.POOL_SIZE)
+  ) {
     const url = listUrl(run, run.date);
     let t;
     try {
@@ -450,7 +472,7 @@ async function assign() {
   const claimed = [];
   for (const job of waiting) {
     const entry = Object.entries(pool).find(
-      ([, p]) => p.ready && !p.busy && p.date === job.date,
+      ([, p]) => !isWork(p) && p.ready && !p.busy && p.date === job.date,
     );
     if (!entry) continue;
     const tabId = Number(entry[0]);
@@ -468,6 +490,94 @@ async function assign() {
       .sendMessage(tabId, { channel: "TO_LHIMS", type: "AUTO_GO" })
       .catch(() => {});
   }
+}
+
+// The attachment page for a matched visit, as fUpdateSchedule builds it.
+function updateUrl(run, job) {
+  if (!/^\d+$/.test(String(job.scheduleId || ""))) return null;
+  const flags = String(job.visitFlags || "").split(",");
+  const u = new URL(C.PAGES.update, run.base);
+  u.searchParams.set("iScheduleID", String(job.scheduleId));
+  VISIT_FLAGS.forEach((name, i) =>
+    u.searchParams.set(name, /^\d+$/.test(flags[i] || "") ? flags[i] : "0"),
+  );
+  return u.href;
+}
+
+// MATCHED in an auto run: move the job to a work tab opened on the attachment
+// page, and give the list tab straight back for the next patient.
+async function handOff(job, listTabId) {
+  const run = await read("run");
+  if (!WORK_TABS || !job.auto || run?.status !== "RUNNING") return false;
+  const url = updateUrl(run, job);
+  if (!url) return false;
+  const pool = await read("pool", {});
+  const free = Object.entries(pool).find(([, p]) => isWork(p) && !p.busy);
+  let workId = free ? Number(free[0]) : null;
+  if (workId != null) {
+    try {
+      await chrome.tabs.update(workId, {
+        url,
+        ...(A.ACTIVATE_TAB ? { active: true } : {}),
+      });
+    } catch {
+      delete pool[workId]; // gone: open a new one below
+      workId = null;
+    }
+  }
+  if (workId == null) {
+    let t;
+    try {
+      t = await chrome.tabs.create({
+        url,
+        active: !!A.ACTIVATE_TAB,
+        windowId: run.windowId,
+      });
+    } catch {
+      try {
+        t = await chrome.tabs.create({ url, active: !!A.ACTIVATE_TAB });
+      } catch {
+        return false; // keep the old way: the list tab clicks through
+      }
+    }
+    workId = t.id;
+    chrome.tabs.update(workId, { autoDiscardable: false }).catch(() => {});
+  }
+  pool[workId] = { kind: "work", busy: true };
+  if (pool[listTabId])
+    pool[listTabId] = { date: pool[listTabId].date, ready: true }; // still loaded: reuse at once
+  const jobs = await readJobs();
+  jobs[job.jobId] = { ...jobs[job.jobId], claimedTabId: workId };
+  await store.set({ pool, jobs });
+  await broadcast();
+  await assign();
+  return true;
+}
+
+// After a job ends: a work tab is simply free again; a list tab is kept as it
+// is when the job ended cleanly on it, otherwise reloaded.
+async function release(job, run) {
+  const tabId = job.claimedTabId;
+  if (tabId == null) return;
+  const pool = await read("pool", {});
+  const p = pool[tabId];
+  if (!p) return;
+  if (isWork(p)) {
+    pool[tabId] = { kind: "work", busy: false };
+    await store.set({ pool });
+    return;
+  }
+  if (
+    WORK_TABS &&
+    job.stage === "NEEDS_ATTENTION" &&
+    KEEP_LIST.has(job.reason) &&
+    p.date === run.date
+  ) {
+    pool[tabId] = { date: run.date, ready: true };
+    await store.set({ pool });
+    return assign();
+  }
+  return recycle(tabId, run);
 }
 
 async function recycle(tabId, run) {
@@ -518,7 +628,7 @@ async function afterTerminal(job) {
   }
   if (next.problems >= A.MAX_CONSECUTIVE_PROBLEMS)
     return stopRun("TOO_MANY_PROBLEMS", true);
-  await recycle(job.claimedTabId, next);
+  await release(job, next);
 }
 
 async function finishRun(reason, keepPool) {
@@ -815,9 +925,10 @@ async function onLhims(msg, sender) {
       if (!job || !REPORTABLE.has(msg.stage))
         return { ok: false, error: "REJECTED" };
       const next = await transition(job.jobId, msg.stage, msg.patch || {});
-      return next
-        ? { ok: true, ...(await view(next)) }
-        : { ok: false, error: "IGNORED" };
+      if (!next) return { ok: false, error: "IGNORED" };
+      if (msg.stage === "MATCHED" && (await handOff(next, tabId)))
+        return { ok: true, handoff: true, state: await tabState(tabId) };
+      return { ok: true, ...(await view(next)) };
     }
     case "SAVE_CLICKED": {
       // UNVERIFIED is terminal, so look past liveJobOfTab for a manual re-save

@@ -612,15 +612,35 @@
         : "";
 
     const icon = one("updateIcon", S.list.updateIcon, pick.block); // this row only
-    const sid = (icon.getAttribute("onclick") || "").match(
-      /fUpdateSchedule\(\s*(\d+)/,
-    )?.[1];
+    // fUpdateSchedule(iScheduleID, iDialysis, iAccidentEmergency, iOncology,
+    //                 iPediatric, iANC, iSurgery, iRadiology)
+    const args = ((icon.getAttribute("onclick") || "").match(
+      /fUpdateSchedule\(([^)]*)\)/,
+    )?.[1] || "")
+      .split(",")
+      .map((a) => a.trim().replace(/^['"]|['"]$/g, ""));
+    const sid = /^\d+$/.test(args[0] || "") ? args[0] : null;
     if (!sid) throw new Problem("NEEDS_ATTENTION", "SCHEDULE_ID_UNREADABLE");
+    // the 7 flags, defaulting to 0 like fUpdateSchedule's own parameters
+    const flags = Array.from({ length: 7 }, (_, i) =>
+      /^\d+$/.test(args[i + 1] || "") ? args[i + 1] : "0",
+    );
     stillHere();
-    await progress("MATCHED", {
-      scheduleId: sid,
-      ...(how ? { warn: how } : {}),
+    const r = await sw({
+      type: "PROGRESS",
+      stage: "MATCHED",
+      patch: {
+        scheduleId: sid,
+        visitFlags: flags.join(","),
+        ...(how ? { warn: how } : {}),
+      },
     });
+    if (!r?.ok) throw new Problem("EXTENSION_ERROR", r?.error || "REJECTED");
+    state = r.state;
+    Badge.render(state, ctx());
+    // Auto runs open the attachment page in a separate work tab, so this list
+    // stays loaded for the next patient (no reload between referrals).
+    if (r.handoff) return;
     leaving = true; // the click navigates to the attachment page
     icon.click(); // same-tab navigation; in auto mode the update confirmation is accepted by dialogs.js
   }
@@ -980,7 +1000,9 @@
 
   // ---------- boot ----------
   async function adoptJob() {
-    // called after an AUTO_GO message
+    // called after an AUTO_GO message; a list tab may still be finishing the
+    // previous patient (it was handed over to a work tab a moment ago)
+    for (let i = 0; running && i < 100; i++) await sleep(50);
     const r = await sw({
       type: "HELLO",
       page: pageKind(),
