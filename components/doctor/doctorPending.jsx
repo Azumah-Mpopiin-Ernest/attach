@@ -13,15 +13,22 @@ import {
 } from "../../src/firebaseData";
 
 const PAGE_SIZE = 25;
-const MAX_BATCH = 100;
+const MAX_BATCH = 5000;
 const SEARCH_DEBOUNCE_MS = 200;
-// Firestore caps a transaction at 10 MiB. Signature data URLs are copied onto
-// every referral, so large inline signatures shrink the chunk size.
+// Firestore caps a single transaction at 10 MiB. Signature data URLs are
+// copied onto every referral, so large inline signatures shrink the chunk
+// size (the 500-write transaction cap is also enforced, centrally, inside
+// updateReferralsTransaction).
 const TRANSACTION_BYTE_BUDGET = 6_000_000;
 const MAX_INLINE_SIGNATURE_CHARS = 700_000; // a Firestore document is 1 MiB max
 // statusHistory is append-only by nature; cap it so it can't keep growing a
 // document toward the 1 MiB Firestore limit as a referral gets re-touched.
 const MAX_STATUS_HISTORY_ENTRIES = 20;
+// How many transaction chunks run at once during a bulk sign. Each chunk
+// touches a disjoint set of referrals, so they can't conflict with one
+// another — running several in parallel cuts wall-clock time for a large
+// batch without changing how many reads/writes get billed.
+const SIGN_CONCURRENCY = 4;
 
 export default function DoctorPending({
   doctorId,
@@ -38,12 +45,13 @@ export default function DoctorPending({
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(1);
   const [selectedIds, setSelectedIds] = useState([]);
-  const [signingIds, setSigningIds] = useState([]);
+  const [signingIds, setSigningIds] = useState(() => new Set());
+  const [signProgress, setSignProgress] = useState(null); // { processed, total }
   const [signatureSide, setSignatureSide] = useState("from");
   const [queueTab, setQueueTab] = useState("unsigned");
   const [confirmState, setConfirmState] = useState(null); // { items, sideLabel }
 
-  const isSigning = signingIds.length > 0;
+  const isSigning = signingIds.size > 0;
 
   useEffect(() => {
     return subscribeToReferrals(
@@ -148,7 +156,7 @@ export default function DoctorPending({
 
   const limitMessage = {
     type: "warning",
-    text: `You can sign up to ${MAX_BATCH} referrals at a time.`,
+    text: `You can sign up to ${MAX_BATCH.toLocaleString()} referrals at a time.`,
   };
 
   const toggleSelected = (id) => {
@@ -193,15 +201,17 @@ export default function DoctorPending({
   // requestSign — never call this directly from the UI.
   const performSign = async (items) => {
     const ids = items.map((item) => item.id);
+    // Per-chunk size from the byte budget; the 500-write Firestore cap is
+    // enforced again, centrally, inside updateReferralsTransaction.
     const chunkSize = Math.max(
       1,
-      Math.min(
-        MAX_BATCH,
-        Math.floor(TRANSACTION_BYTE_BUDGET / (signatureUrl.length + 2_000)),
-      ),
+      Math.floor(TRANSACTION_BYTE_BUDGET / (signatureUrl.length + 2_000)),
     );
+    // Only worth parallelizing when there's more than one chunk to run.
+    const concurrency = ids.length > chunkSize ? SIGN_CONCURRENCY : 1;
 
-    setSigningIds(ids);
+    setSigningIds(new Set(ids));
+    setSignProgress({ processed: 0, total: ids.length });
     setMessage(null);
 
     const reportSkipped = (skipped) => {
@@ -226,7 +236,11 @@ export default function DoctorPending({
                 ? missingSide(fresh)
                 : signatureSide,
           }),
-        { chunkSize },
+        {
+          chunkSize,
+          concurrency,
+          onProgress: (progress) => setSignProgress(progress),
+        },
       );
       // The live subscription removes signed referrals from the queue.
       const signedIds = new Set(applied.map((item) => item.id));
@@ -247,7 +261,8 @@ export default function DoctorPending({
           : `Nothing was signed: ${writeError.message}`,
       });
     } finally {
-      setSigningIds([]);
+      setSigningIds(new Set());
+      setSignProgress(null);
     }
   };
 
@@ -383,7 +398,7 @@ export default function DoctorPending({
                 disabled={isSigning || filtered.length === 0}
                 className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                Select first {firstBatchCount}
+                Select first {firstBatchCount.toLocaleString()}
               </button>
             )}
             <button
@@ -398,8 +413,10 @@ export default function DoctorPending({
                 <CheckCircle2 className="h-4 w-4" />
               )}
               {isSigning
-                ? `Signing ${signingIds.length}...`
-                : `Approve & Sign${selectedItems.length ? ` (${selectedItems.length})` : ""}`}
+                ? signProgress && signProgress.total > 1
+                  ? `Signing ${signProgress.processed.toLocaleString()}/${signProgress.total.toLocaleString()}...`
+                  : "Signing..."
+                : `Approve & Sign${selectedItems.length ? ` (${selectedItems.length.toLocaleString()})` : ""}`}
             </button>
             {selectedIds.length === 0 && filtered.length > 1 && (
               <button
@@ -408,7 +425,7 @@ export default function DoctorPending({
                 disabled={isSigning}
                 className="inline-flex items-center gap-1.5 rounded-md border border-[#2F6F62] px-4 py-2 text-sm font-medium text-[#2F6F62] hover:bg-[#2F6F62]/10 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                Sign first {firstBatchCount}
+                Sign first {firstBatchCount.toLocaleString()}
               </button>
             )}
           </div>
@@ -438,7 +455,8 @@ export default function DoctorPending({
             <div className="flex items-center gap-4 pb-2">
               {selectedIds.length > 0 && (
                 <span className="text-sm text-slate-500">
-                  {selectedIds.length}/{MAX_BATCH} selected
+                  {selectedIds.length.toLocaleString()}/
+                  {MAX_BATCH.toLocaleString()} selected
                 </span>
               )}
               <CompactPager
@@ -568,12 +586,12 @@ export default function DoctorPending({
                         onClick={() => requestSign([referral])}
                         className="inline-flex items-center gap-1.5 rounded-md bg-[#2F6F62] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#265a50] disabled:cursor-not-allowed disabled:opacity-50"
                       >
-                        {signingIds.includes(referral.id) ? (
+                        {signingIds.has(referral.id) ? (
                           <Loader2 className="h-3.5 w-3.5 animate-spin" />
                         ) : (
                           <CheckCircle2 className="h-3.5 w-3.5" />
                         )}
-                        {signingIds.includes(referral.id)
+                        {signingIds.has(referral.id)
                           ? "Signing..."
                           : "Approve & Sign"}
                       </button>
@@ -639,8 +657,8 @@ function ConfirmSignDialog({ count, sideLabel, onCancel, onConfirm }) {
           </button>
         </div>
         <p className="mt-2 text-sm text-slate-600">
-          Sign {count} referral{count === 1 ? "" : "s"} as {sideLabel}? This
-          can't be undone.
+          Sign {count.toLocaleString()} referral{count === 1 ? "" : "s"} as{" "}
+          {sideLabel}? This can't be undone.
         </p>
         <div className="mt-5 flex justify-end gap-2">
           <button
@@ -656,7 +674,7 @@ function ConfirmSignDialog({ count, sideLabel, onCancel, onConfirm }) {
             onClick={onConfirm}
             className="rounded-md bg-[#2F6F62] px-4 py-2 text-sm font-medium text-white hover:bg-[#265a50]"
           >
-            Sign {count}
+            Sign {count.toLocaleString()}
           </button>
         </div>
       </div>
@@ -676,7 +694,8 @@ function CompactPager({ page, pageCount, pageSize, total, onPageChange }) {
       aria-label="Pagination"
     >
       <span className="hidden text-slate-400 sm:inline">
-        {from}–{to} of {total}
+        {from.toLocaleString()}–{to.toLocaleString()} of{" "}
+        {total.toLocaleString()}
       </span>
       <button
         type="button"

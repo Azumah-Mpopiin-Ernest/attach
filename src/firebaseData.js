@@ -261,31 +261,50 @@ export function updateReferral(referralId, changes) {
  * to skip that referral (e.g. another doctor already signed it). A skipped
  * referral never blocks the others.
  *
- * Referrals are processed in chunks of `chunkSize`; each chunk commits
- * atomically. Firestore caps a transaction at 500 document writes and
- * 10 MiB total, so chunkSize is capped well under that regardless of what
- * the caller passes.
+ * Referrals are processed in chunks of `chunkSize`, each committed as its
+ * own transaction. Firestore caps a single transaction at 500 document
+ * writes, so chunkSize is hard-capped there regardless of what the caller
+ * passes — this matters once batches get large (e.g. bulk-signing several
+ * thousand referrals), where a byte-budget-only chunk size could otherwise
+ * exceed it.
+ *
+ * `concurrency` (default 1, i.e. the original sequential behavior) runs
+ * that many chunks' transactions in flight at once. This is safe because
+ * chunks never share a document, so there's nothing for them to conflict
+ * over — it only cuts wall-clock time for a large batch, with no change to
+ * how many reads or writes are billed.
+ *
+ * `onProgress({ processed, total })` fires after each chunk settles, so a
+ * caller can show something like "2,400 / 5,000" during a long batch.
  *
  * Resolves to { applied: [{ id, changes }], skipped: [{ id, reason }] }.
- * If a chunk fails outright, the thrown error carries `applied` and
- * `skipped` for the chunks that already committed, plus `quotaExceeded`
- * if the failure was the Spark plan's daily quota.
+ * If a chunk fails outright, chunks already in flight are allowed to
+ * finish (no new ones start), and the thrown error carries `applied`/
+ * `skipped` for everything that *did* commit, plus `quotaExceeded` if the
+ * failure was the Spark plan's daily quota.
  */
 export async function updateReferralsTransaction(
   referralIds,
   buildChanges,
-  { chunkSize = 100 } = {},
+  { chunkSize = 100, concurrency = 1, onProgress } = {},
 ) {
   if (!db) throw new Error("Firebase is not configured.");
 
+  const MAX_TRANSACTION_WRITES = 500; // Firestore hard limit, per transaction
   const ids = [...new Set(referralIds)];
-  const size = Math.max(1, Math.min(chunkSize, 400));
+  const size = Math.max(1, Math.min(chunkSize, MAX_TRANSACTION_WRITES));
+  const chunks = [];
+  for (let start = 0; start < ids.length; start += size) {
+    chunks.push(ids.slice(start, start + size));
+  }
+
   const applied = [];
   const skipped = [];
+  let processed = 0;
+  let firstError = null;
 
-  try {
-    for (let start = 0; start < ids.length; start += size) {
-      const chunk = ids.slice(start, start + size);
+  async function runChunk(chunk) {
+    try {
       // The transaction callback may re-run on contention, so it must only
       // build local results; they're merged after a successful commit.
       const result = await runTransaction(db, async (transaction) => {
@@ -317,13 +336,37 @@ export async function updateReferralsTransaction(
       });
       applied.push(...result.applied);
       skipped.push(...result.skipped);
+    } catch (error) {
+      // Keep the first failure; let chunks already in flight finish rather
+      // than aborting them mid-flight.
+      if (!firstError) firstError = error;
+    } finally {
+      processed += chunk.length;
+      onProgress?.({ processed, total: ids.length });
     }
-  } catch (error) {
-    error.applied = applied;
-    error.skipped = skipped;
-    throw tagQuotaError(error);
+  }
+
+  try {
+    let nextIndex = 0;
+    const worker = async () => {
+      for (;;) {
+        if (firstError) return;
+        const myIndex = nextIndex;
+        nextIndex += 1;
+        if (myIndex >= chunks.length) return;
+        await runChunk(chunks[myIndex]);
+      }
+    };
+    const workerCount = Math.max(1, Math.min(concurrency, chunks.length || 1));
+    await Promise.all(Array.from({ length: workerCount }, worker));
   } finally {
     invalidateCollection("referrals");
+  }
+
+  if (firstError) {
+    firstError.applied = applied;
+    firstError.skipped = skipped;
+    throw tagQuotaError(firstError);
   }
 
   return { applied, skipped };
