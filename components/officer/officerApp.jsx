@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import { RefreshCw, Search, WifiOff } from "lucide-react";
+import { RefreshCw, RotateCcw, Search, WifiOff } from "lucide-react";
 import OfficerLayout from "./officerLayout";
 import ConfirmDialog from "../admin/confirmDialog";
 import {
   completeReferral,
+  returnReferralsToActive,
   subscribeToReferrals,
   updateReferral,
 } from "../../src/firebaseData";
@@ -50,9 +51,12 @@ function useBrowserOnline() {
 // Oldest form date first, so the officer works through one admission date
 // at a time. Array.prototype.sort is stable, so referrals sharing a date
 // keep the order Firestore returned them in (same as before).
+// Referrals returned from the Skipped tab (`requeuedAt`) go after all others.
 function sortByDate(referrals) {
-  return [...referrals].sort((a, b) =>
-    compareDateKeys(getDateKey(a), getDateKey(b)),
+  return [...referrals].sort(
+    (a, b) =>
+      (a.requeuedAt ? 1 : 0) - (b.requeuedAt ? 1 : 0) ||
+      compareDateKeys(getDateKey(a), getDateKey(b)),
   );
 }
 
@@ -354,6 +358,26 @@ export default function OfficerApp({ officerName, onSignOut }) {
       .finally(() => setUnsynced((count) => Math.max(0, count - 1)));
   };
 
+  // Every skipped referral back to the bottom of the active list. The local
+  // cache moves them at once; the write syncs in the background.
+  const [confirmReturnAll, setConfirmReturnAll] = useState(false);
+  const [returningAll, setReturningAll] = useState(false);
+  const returnAllSkipped = () => {
+    setConfirmReturnAll(false);
+    const ids = skippedQueue.map((referral) => referral.id);
+    if (!ids.length) return;
+    setError("");
+    setReturningAll(true);
+    ids.forEach(clearSkipNote);
+    returnReferralsToActive(ids)
+      .catch((writeError) =>
+        setError(
+          `Returned ${writeError.updated ?? 0} of ${ids.length} skipped referrals: ${writeError.message}`,
+        ),
+      )
+      .finally(() => setReturningAll(false));
+  };
+
   // Drives the extension's auto run: sends the next form, marks each
   // referral done once LHIMS verified it, and skips (with the reason) any
   // referral that ends in a problem so the run keeps going.
@@ -449,8 +473,18 @@ export default function OfficerApp({ officerName, onSignOut }) {
             <div className="flex flex-wrap items-end justify-between gap-4">
               <p className="max-w-md text-sm text-slate-500">
                 Referrals you put on hold. Attach each form in LHIMS when it
-                works again, then mark it done here.
+                works again, then mark it done here, or return them all to the
+                end of your active list.
               </p>
+              <button
+                type="button"
+                onClick={() => setConfirmReturnAll(true)}
+                disabled={!skippedQueue.length || returningAll}
+                className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <RotateCcw className="h-4 w-4" />
+                {returningAll ? "Returning…" : "Return all to active"}
+              </button>
               <div className="relative">
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
                 <input
@@ -507,6 +541,14 @@ export default function OfficerApp({ officerName, onSignOut }) {
         confirmLabel="Yes, mark done"
         onConfirm={() => markDone(pendingDone)}
         onCancel={() => setPendingDone(null)}
+      />
+      <ConfirmDialog
+        open={confirmReturnAll}
+        title="Return all skipped referrals?"
+        description={`All ${skippedQueue.length} skipped referral${skippedQueue.length === 1 ? "" : "s"} go back to the end of your active list, and their skip notes are cleared.`}
+        confirmLabel="Yes, return them"
+        onConfirm={returnAllSkipped}
+        onCancel={() => setConfirmReturnAll(false)}
       />
       <ConfirmDialog
         open={Boolean(pendingSkip)}

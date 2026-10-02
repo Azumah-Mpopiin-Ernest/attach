@@ -725,6 +725,15 @@ export async function updateDocuments(collectionName, documentIds, changes) {
   }
 }
 
+// Puts an officer's skipped referrals back in their active queue. They carry
+// `requeuedAt`, which sorts them after every other active referral.
+export function returnReferralsToActive(referralIds) {
+  return updateDocuments("referrals", referralIds, {
+    status: "ASSIGNED",
+    requeuedAt: new Date(),
+  });
+}
+
 /**
  * On failure, the thrown error carries `created` — how many documents had
  * already committed in prior batches. Unlike updateDocuments, retrying the

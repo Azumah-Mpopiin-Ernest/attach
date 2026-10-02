@@ -1,12 +1,9 @@
 import hospitalLogo from "../hfch-logo.png?inline";
-import { jsPDF } from "jspdf";
-import { getDateKey, compareDateKeys } from "./referralDates";
-import JSZip from "jszip";
 import { getSignatureImage } from "./firebaseData";
 
 const FORM_WIDTH = 1600;
 const FORM_HEIGHT = 1067;
-const FORM_ASPECT = FORM_WIDTH / FORM_HEIGHT; // ~1.4995
+export const FORM_ASPECT = FORM_WIDTH / FORM_HEIGHT; // ~1.4995
 
 // --- Single-form render ---
 // THIS IS THE ONLY DEFINITION OF THE REFERRAL FORM DESIGN. Every download in
@@ -193,138 +190,6 @@ export async function downloadReferralForm(referral) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-// --- Bulk print sheets: one A4 PDF per 4 forms, delivered as a zip ---
-const A4_WIDTH_MM = 297;
-const A4_HEIGHT_MM = 210;
-const PAGE_MARGIN_MM = 6;
-const CUT_GUTTER_MM = 4;
-const FORMS_PER_SHEET = 4;
-
-const RENDER_BATCH_SIZE = 40; // ~10 sheets' worth of forms per batch
-
-export async function downloadReadyToAssignFormsZip(
-  referrals,
-  zipFileName,
-  onProgress,
-) {
-  const sorted = [...referrals].sort((a, b) =>
-    compareDateKeys(getDateKey(a), getDateKey(b)),
-  );
-  if (!sorted.length) throw new Error("No referrals are ready to assign.");
-
-  const zip = new JSZip();
-  let sheetIndex = 0;
-  let leftover = []; // canvases carried over when a batch doesn't end on a sheet boundary
-
-  const referralBatches = chunk(sorted, RENDER_BATCH_SIZE);
-
-  for (const referralBatch of referralBatches) {
-    // Render only this batch's canvases — everything from prior batches
-    // is already gone (turned into PDF bytes) by the time we get here.
-    // (Explicit arrow so .map's index isn't passed as the options argument.)
-    const batchCanvases = await Promise.all(
-      referralBatch.map((referral) => renderReferralFormCanvas(referral)),
-    );
-
-    const available = [...leftover, ...batchCanvases];
-    const sheets = chunk(available, FORMS_PER_SHEET);
-
-    // Hold back a final partial group in case the *next* batch completes it,
-    // so we don't ship a sheet with only 1–3 forms unless it's truly the end.
-    const isLastBatch =
-      referralBatch === referralBatches[referralBatches.length - 1];
-    const completeSheets = isLastBatch
-      ? sheets
-      : sheets.filter((s) => s.length === FORMS_PER_SHEET);
-    leftover = isLastBatch
-      ? []
-      : (sheets.find((s) => s.length < FORMS_PER_SHEET) ?? []);
-
-    completeSheets.forEach((sheetCanvases) => {
-      const pdf = buildSheetPdf(sheetCanvases);
-      const pdfBytes = pdf.output("arraybuffer");
-      sheetIndex += 1;
-      const sheetNumber = String(sheetIndex).padStart(3, "0");
-      zip.file(`referral-forms-sheet-${sheetNumber}.pdf`, pdfBytes);
-    });
-
-    onProgress?.({
-      formsProcessed: Math.min(
-        (referralBatches.indexOf(referralBatch) + 1) * RENDER_BATCH_SIZE,
-        sorted.length,
-      ),
-      totalForms: sorted.length,
-    });
-    // batchCanvases (and any consumed leftover canvases) fall out of scope
-    // here and become eligible for GC before the next loop iteration.
-  }
-
-  const zipBlob = await zip.generateAsync({ type: "blob" });
-  const url = URL.createObjectURL(zipBlob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = zipFileName ?? defaultZipFileName();
-  anchor.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-
-  return sheetIndex;
-}
-
-function buildSheetPdf(sheetCanvases) {
-  const pdf = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
-  drawCutGuides(pdf);
-
-  const usableWidth = A4_WIDTH_MM - PAGE_MARGIN_MM * 2 - CUT_GUTTER_MM;
-  const usableHeight = A4_HEIGHT_MM - PAGE_MARGIN_MM * 2 - CUT_GUTTER_MM;
-  const cellWidth = usableWidth / 2;
-  const cellHeight = usableHeight / 2;
-
-  sheetCanvases.forEach((canvas, positionOnSheet) => {
-    const col = positionOnSheet % 2;
-    const row = Math.floor(positionOnSheet / 2);
-    const cellX = PAGE_MARGIN_MM + col * (cellWidth + CUT_GUTTER_MM);
-    const cellY = PAGE_MARGIN_MM + row * (cellHeight + CUT_GUTTER_MM);
-
-    let drawWidth = cellWidth;
-    let drawHeight = drawWidth / FORM_ASPECT;
-    if (drawHeight > cellHeight) {
-      drawHeight = cellHeight;
-      drawWidth = drawHeight * FORM_ASPECT;
-    }
-    const drawX = cellX + (cellWidth - drawWidth) / 2;
-    const drawY = cellY + (cellHeight - drawHeight) / 2;
-
-    const imageData = canvas.toDataURL("image/jpeg", 0.9);
-    pdf.addImage(imageData, "JPEG", drawX, drawY, drawWidth, drawHeight);
-  });
-
-  return pdf;
-}
-
-function drawCutGuides(pdf) {
-  pdf.setDrawColor(190);
-  pdf.setLineWidth(0.2);
-  pdf.setLineDashPattern([1.5, 1.5], 0);
-  const midX = A4_WIDTH_MM / 2;
-  const midY = A4_HEIGHT_MM / 2;
-  pdf.line(midX, PAGE_MARGIN_MM / 2, midX, A4_HEIGHT_MM - PAGE_MARGIN_MM / 2);
-  pdf.line(PAGE_MARGIN_MM / 2, midY, A4_WIDTH_MM - PAGE_MARGIN_MM / 2, midY);
-  pdf.setLineDashPattern([], 0);
-}
-
-function chunk(items, size) {
-  const chunks = [];
-  for (let i = 0; i < items.length; i += size) {
-    chunks.push(items.slice(i, i + size));
-  }
-  return chunks;
-}
-
-function defaultZipFileName() {
-  const today = new Date().toISOString().slice(0, 10);
-  return `referral-forms-${today}.zip`;
-}
-
 const INK_FONT_FAMILY = "Arial, Helvetica, sans-serif";
 const measureContext = document.createElement("canvas").getContext("2d");
 
@@ -435,31 +300,14 @@ async function drawSignature(
     return;
   }
 
-  const crop = opaqueBounds(image);
-  if (!crop) return;
+  const signatureCanvas = inkedSignature(image);
+  if (!signatureCanvas) return;
+  const crop = signatureCanvas;
   const scale = Math.min(width / crop.width, height / crop.height);
   const drawWidth = crop.width * scale;
   const drawHeight = crop.height * scale;
   const drawX = x + (width - drawWidth) / 2;
   const drawY = y + (height - drawHeight) / 2;
-  const signatureCanvas = document.createElement("canvas");
-  signatureCanvas.width = crop.width;
-  signatureCanvas.height = crop.height;
-  const signatureContext = signatureCanvas.getContext("2d");
-  signatureContext.drawImage(
-    image,
-    crop.x,
-    crop.y,
-    crop.width,
-    crop.height,
-    0,
-    0,
-    crop.width,
-    crop.height,
-  );
-  signatureContext.globalCompositeOperation = "source-in";
-  signatureContext.fillStyle = "#253d98";
-  signatureContext.fillRect(0, 0, crop.width, crop.height);
 
   context.imageSmoothingEnabled = true;
   context.imageSmoothingQuality = "high";
@@ -505,7 +353,47 @@ async function drawSignature(
   signatureCanvas.height = 0;
 }
 
+// The cropped, ink-coloured signature depends only on the image, so it is
+// made once per image and reused for every form (bulk exports draw the same
+// few signatures thousands of times).
+const inkedCache = new WeakMap();
+function inkedSignature(image) {
+  if (inkedCache.has(image)) return inkedCache.get(image);
+  const crop = opaqueBounds(image);
+  let canvas = null;
+  if (crop) {
+    canvas = document.createElement("canvas");
+    canvas.width = crop.width;
+    canvas.height = crop.height;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(
+      image,
+      crop.x,
+      crop.y,
+      crop.width,
+      crop.height,
+      0,
+      0,
+      crop.width,
+      crop.height,
+    );
+    ctx.globalCompositeOperation = "source-in";
+    ctx.fillStyle = "#253d98";
+    ctx.fillRect(0, 0, crop.width, crop.height);
+  }
+  inkedCache.set(image, canvas);
+  return canvas;
+}
+
+// Hashing a whole inline image (up to ~700 KB) for every form adds up, so the
+// result is remembered per source.
+const jitterCache = new Map();
 function seededJitter(source) {
+  if (!jitterCache.has(source)) jitterCache.set(source, computeJitter(source));
+  return jitterCache.get(source);
+}
+
+function computeJitter(source) {
   let hash = 0;
   for (let i = 0; i < source.length; i += 1) {
     hash = (hash * 31 + source.charCodeAt(i)) | 0;

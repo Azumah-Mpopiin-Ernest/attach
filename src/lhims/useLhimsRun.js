@@ -174,6 +174,21 @@ export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
     }
   }, [ext]);
 
+  // A referral that left the queue (skipped) and came back (returned from the
+  // Skipped tab) must be worked again, even within the same run.
+  const gone = useRef(new Set());
+  useEffect(() => {
+    const inQueue = new Set(queue.map((r) => r.id));
+    for (const id of processed.current) {
+      if (!inQueue.has(id)) gone.current.add(id);
+      else if (gone.current.has(id)) {
+        gone.current.delete(id);
+        processed.current.delete(id);
+        submitted.current.delete(id);
+      }
+    }
+  }, [queue]);
+
   // driver: keep up to `concurrency` referrals in flight, or stop when nothing is left
   useEffect(() => {
     const running = ext.run?.status === "RUNNING";

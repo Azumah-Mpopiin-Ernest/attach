@@ -28,8 +28,10 @@ import {
 } from "../../src/referralDates";
 import Pagination from "../shared/Pagination";
 
-import { downloadReadyToAssignFormsZip } from "../../src/referralForm";
-import { downloadAllReferralImagesZip } from "../../src/referralImages";
+import {
+  downloadAllReferralImagesZip,
+  downloadPrintSheetsZip,
+} from "../../src/referralImages";
 
 const PAGE_SIZE = 25;
 const NOTICE_DURATION_MS = 4000;
@@ -97,7 +99,7 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
   const [page, setPage] = useState(1);
   const [collapsedDates, setCollapsedDates] = useState(() => new Set());
   const [downloadingForms, setDownloadingForms] = useState(false);
-  const [downloadProgress, setDownloadProgress] = useState(null); // { formsProcessed, totalForms }
+  const [downloadProgress, setDownloadProgress] = useState(null); // { phase, done, total, failed }
 
   // Export every downloadable referral as an individual PNG inside one ZIP.
   const [exportingImages, setExportingImages] = useState(false);
@@ -302,30 +304,39 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
     });
   };
 
-  const downloadAllForms = async () => {
+  // Deliberately NOT async, and nothing is awaited before the call: the
+  // browser's "save as" dialog needs the click's user activation. Forms are
+  // rendered one at a time and streamed to disk, so large batches no longer
+  // freeze the tab.
+  const downloadAllForms = () => {
+    const controller = new AbortController();
+    exportAbort.current = controller;
     setDownloadingForms(true);
     setDownloadProgress(null);
-    try {
-      const currentReferrals = await getReferrals({ force: true });
-      const downloadable = currentReferrals.filter(isDownloadableReferral);
-      if (downloadable.length === 0) {
-        throw new Error("No ready or assigned referrals to download.");
-      }
-      const sheetCount = await downloadReadyToAssignFormsZip(
-        downloadable,
-        undefined,
-        setDownloadProgress,
-      );
-      showNotice(
-        "success",
-        `Downloaded ${sheetCount} print sheet${sheetCount === 1 ? "" : "s"} (${downloadable.length} form${downloadable.length === 1 ? "" : "s"}).`,
-      );
-    } catch (downloadError) {
-      showNotice("error", downloadError.message);
-    } finally {
-      setDownloadingForms(false);
-      setDownloadProgress(null);
-    }
+
+    downloadPrintSheetsZip({
+      loadReferrals: async () =>
+        (await getReferrals({ force: true })).filter(isDownloadableReferral),
+      signal: controller.signal,
+      onProgress: setDownloadProgress,
+    })
+      .then(({ forms, failed, pdfs, parts }) => {
+        const partNote = parts > 1 ? ` in ${parts} ZIP files` : "";
+        showNotice(
+          failed.length ? "error" : "success",
+          failed.length
+            ? `Prepared ${forms} forms in ${pdfs} PDF${pdfs === 1 ? "" : "s"}${partNote}; ${failed.length} could not be drawn and were left blank.`
+            : `Prepared ${forms} form${forms === 1 ? "" : "s"} in ${pdfs} print-ready PDF${pdfs === 1 ? "" : "s"}${partNote}.`,
+        );
+      })
+      .catch((error) => {
+        if (error?.name !== "AbortError") showNotice("error", error.message);
+      })
+      .finally(() => {
+        setDownloadingForms(false);
+        setDownloadProgress(null);
+        exportAbort.current = null;
+      });
   };
 
   // Deliberately NOT async, and nothing is awaited before the call: the
@@ -834,19 +845,28 @@ export default function AdminExplorer({ initialStatusFilter = "" }) {
               Print sheets
             </h2>
             <p className="mt-1 text-sm text-slate-500">
-              A ZIP of print-ready sheets containing the referral forms.
+              A ZIP of print-ready A4 PDFs (4 forms per sheet, up to 100
+              forms per PDF), oldest form date first.
             </p>
             <button
               type="button"
-              onClick={downloadAllForms}
-              disabled={busy || loading || downloadableCount === 0}
+              onClick={
+                downloadingForms
+                  ? () => exportAbort.current?.abort()
+                  : downloadAllForms
+              }
+              disabled={
+                exportingImages ||
+                deleting ||
+                (!downloadingForms && (loading || downloadableCount === 0))
+              }
               className="mt-3 flex items-center justify-center gap-2 cursor-pointer border border-black hover:bg-[#2F6F62] transition p-2 rounded-xl disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Download className="h-4 w-4" />
               {downloadingForms
-                ? downloadProgress
-                  ? `Preparing ${downloadProgress.formsProcessed}/${downloadProgress.totalForms}...`
-                  : "Preparing PDFs..."
+                ? downloadProgress?.phase === "rendering"
+                  ? `Preparing ${downloadProgress.done}/${downloadProgress.total} · Cancel`
+                  : "Preparing… · Cancel"
                 : "Print Forms"}
             </button>
           </div>
