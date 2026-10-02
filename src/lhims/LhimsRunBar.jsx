@@ -15,7 +15,7 @@ const STOP_TEXT = {
   TOO_MANY_PROBLEMS:
     "Stopped: several referrals in a row had problems, so something may be wrong. Check the Skipped Referrals tab, then start again.",
   FORM_RENDER_FAILED:
-    "Stopped: the form could not be prepared (signatures may not be saved on this device).",
+    "Stopped: a referral's form could not be prepared. The reason is shown below.",
   BAD_DATE: "Stopped: a referral has a date the extension cannot use.",
 };
 

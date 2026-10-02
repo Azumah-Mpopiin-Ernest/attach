@@ -6,6 +6,7 @@ import {
   doc,
   getCountFromServer,
   getDoc,
+  getDocFromCache,
   getDocs,
   increment,
   limit,
@@ -896,7 +897,17 @@ export async function ensureSignatureDocument(doctorId, dataUrl) {
 }
 
 // The signature image (a data URL) for a signature id, or null if missing.
+// Signature documents never change, so a copy already on this device (the
+// Firestore offline cache) is used first: no read against the daily quota,
+// and it still works offline or once the quota is used up.
 export async function getSignatureImage(signatureId) {
+  if (!db) throw new Error("Firebase is not configured.");
+  try {
+    const cached = await getDocFromCache(doc(db, "signatures", signatureId));
+    if (cached.exists()) return cached.data().dataUrl ?? null;
+  } catch {
+    /* not on this device yet: ask the server */
+  }
   const signature = await getDocument("signatures", signatureId);
   return signature?.dataUrl ?? null;
 }

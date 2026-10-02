@@ -111,7 +111,7 @@ export async function renderReferralFormCanvas(
     ((referral.referredFromSignatureId && !fromSignature) ||
       (referral.referredToSignatureId && !toSignature))
   ) {
-    throw new Error(SIGNATURE_UNAVAILABLE);
+    throw signatureUnavailable();
   }
 
   await drawSignature(
@@ -237,6 +237,20 @@ const SIGNATURE_UNAVAILABLE =
 // Signature id -> its image, looked up once per session. A failed or empty
 // lookup is not cached, so it is retried next time.
 const signatureCache = new Map();
+let lastSignatureError = null; // why the most recent signature lookup failed
+
+// Says why a doctor's signature could not be loaded, as precisely as known.
+function signatureUnavailable() {
+  if (lastSignatureError?.quotaExceeded)
+    return new Error(
+      "A doctor's signature couldn't be loaded because Firebase's free daily limit is used up. It resets each day (midnight Pacific time, early morning in Ghana); forms whose signatures were already loaded on this device keep working.",
+    );
+  return new Error(
+    lastSignatureError
+      ? `${SIGNATURE_UNAVAILABLE} (${lastSignatureError.message})`
+      : SIGNATURE_UNAVAILABLE,
+  );
+}
 
 // Newer referrals point at a signature document (`id`); older ones carry the
 // image inline (`url`).
@@ -247,7 +261,10 @@ function signatureSource(url, id) {
     signatureCache.set(
       id,
       getSignatureImage(id)
-        .catch(() => null)
+        .catch((error) => {
+          lastSignatureError = error;
+          return null;
+        })
         .then((source) => {
           if (!source) signatureCache.delete(id);
           return source;

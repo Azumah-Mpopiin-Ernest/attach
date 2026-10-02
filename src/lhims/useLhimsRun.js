@@ -243,8 +243,12 @@ export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
         let job;
         try {
           job = await jobFor(next);
-        } catch {
+        } catch (renderError) {
           submitted.current.delete(next.id);
+          const who = next.name || next.patientId || "a referral";
+          setStartError(
+            `The form for ${who} could not be prepared: ${renderError?.message || "unknown error"}`,
+          );
           await stop("FORM_RENDER_FAILED");
           return;
         }
