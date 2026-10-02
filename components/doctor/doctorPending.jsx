@@ -8,6 +8,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  ensureSignatureDocument,
   subscribeToReferrals,
   updateReferralsTransaction,
 } from "../../src/firebaseData";
@@ -15,12 +16,12 @@ import {
 const PAGE_SIZE = 25;
 const MAX_BATCH = 5000;
 const SEARCH_DEBOUNCE_MS = 200;
-// Firestore caps a single transaction at 10 MiB. Signature data URLs are
-// copied onto every referral, so large inline signatures shrink the chunk
-// size (the 500-write transaction cap is also enforced, centrally, inside
-// updateReferralsTransaction).
+// Firestore caps a single transaction at 10 MiB. Referrals now carry only a
+// short signature id, so in practice the 500-write transaction cap (enforced
+// centrally inside updateReferralsTransaction) sets the chunk size.
 const TRANSACTION_BYTE_BUDGET = 6_000_000;
-const MAX_INLINE_SIGNATURE_CHARS = 700_000; // a Firestore document is 1 MiB max
+// The signature image is stored once in its own document (1 MiB max).
+const MAX_INLINE_SIGNATURE_CHARS = 700_000;
 // statusHistory is append-only by nature; cap it so it can't keep growing a
 // document toward the 1 MiB Firestore limit as a referral gets re-touched.
 const MAX_STATUS_HISTORY_ENTRIES = 20;
@@ -201,18 +202,34 @@ export default function DoctorPending({
   // requestSign — never call this directly from the UI.
   const performSign = async (items) => {
     const ids = items.map((item) => item.id);
-    // Per-chunk size from the byte budget; the 500-write Firestore cap is
-    // enforced again, centrally, inside updateReferralsTransaction.
-    const chunkSize = Math.max(
-      1,
-      Math.floor(TRANSACTION_BYTE_BUDGET / (signatureUrl.length + 2_000)),
-    );
-    // Only worth parallelizing when there's more than one chunk to run.
-    const concurrency = ids.length > chunkSize ? SIGN_CONCURRENCY : 1;
 
     setSigningIds(new Set(ids));
     setSignProgress({ processed: 0, total: ids.length });
     setMessage(null);
+
+    // Referrals point at one stored copy of the signature (see
+    // ensureSignatureDocument) instead of each carrying the image.
+    let signatureId;
+    try {
+      signatureId = await ensureSignatureDocument(doctorId, signatureUrl);
+    } catch (saveError) {
+      setMessage({
+        type: "error",
+        text: `Nothing was signed: your signature could not be saved (${saveError.message}).`,
+      });
+      setSigningIds(new Set());
+      setSignProgress(null);
+      return;
+    }
+
+    // Per-chunk size from the byte budget; the 500-write Firestore cap is
+    // enforced again, centrally, inside updateReferralsTransaction.
+    const chunkSize = Math.max(
+      1,
+      Math.floor(TRANSACTION_BYTE_BUDGET / (signatureId.length + 2_000)),
+    );
+    // Only worth parallelizing when there's more than one chunk to run.
+    const concurrency = ids.length > chunkSize ? SIGN_CONCURRENCY : 1;
 
     const reportSkipped = (skipped) => {
       if (!skipped.length) return;
@@ -230,7 +247,7 @@ export default function DoctorPending({
           buildSignChanges(fresh, {
             doctorId,
             doctorName,
-            signatureUrl,
+            signatureId,
             side:
               queueTab === "needsOtherSignature"
                 ? missingSide(fresh)
@@ -746,7 +763,7 @@ function missingSide(referral) {
 // longer be signed (someone else got there first, or it already moved on).
 function buildSignChanges(
   referral,
-  { doctorId, doctorName, signatureUrl, side },
+  { doctorId, doctorName, signatureId, side },
 ) {
   if (referral.status !== "AWAITING_SIGN") {
     throw new Error("Some referrals were already processed by someone else.");
@@ -776,13 +793,13 @@ function buildSignChanges(
     ? {
         referredFromDoctorId: doctorId,
         referredFromDoctorName: doctorName,
-        referredFromSignatureUrl: signatureUrl,
+        referredFromSignatureId: signatureId,
         referredFromSignedAt: now,
       }
     : {
         referredToDoctorId: doctorId,
         referredToDoctorName: doctorName,
-        referredToSignatureUrl: signatureUrl,
+        referredToSignatureId: signatureId,
         referredToSignedAt: now,
       };
 

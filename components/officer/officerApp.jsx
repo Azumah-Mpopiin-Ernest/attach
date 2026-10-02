@@ -24,6 +24,7 @@ import {
 import { useLhimsRun } from "../../src/lhims/useLhimsRun";
 import LhimsRunBar from "../../src/lhims/LhimsRunBar";
 import { saveSkipNote, clearSkipNote } from "../../src/lhims/skipNotes";
+import { prefetchSignature } from "../../src/referralForm";
 
 const PAGE_SIZE = 25;
 
@@ -221,15 +222,20 @@ export default function OfficerApp({ officerName, onSignOut }) {
 
   const offline = !browserOnline || cacheStale;
 
-  // While online, touch each doctor signature image once so the service
-  // worker keeps a copy for offline "Download Form" (active and skipped).
+  // While online, load each doctor signature once so it is kept for offline
+  // "Download Form" (active and skipped): inline images via the service
+  // worker, signature documents via Firestore's local cache.
   useEffect(() => {
     if (offline) return;
     const urls = new Set();
+    const ids = new Set();
     [...assigned, ...skipped].forEach((referral) => {
       [referral.referredFromSignatureUrl, referral.referredToSignatureUrl]
         .filter(Boolean)
         .forEach((url) => urls.add(url));
+      [referral.referredFromSignatureId, referral.referredToSignatureId]
+        .filter(Boolean)
+        .forEach((id) => ids.add(id));
     });
     urls.forEach((url) => {
       if (prefetchedSignatures.has(url)) return;
@@ -237,6 +243,13 @@ export default function OfficerApp({ officerName, onSignOut }) {
       fetch(url, { mode: "cors" }).catch(() =>
         prefetchedSignatures.delete(url),
       );
+    });
+    ids.forEach((id) => {
+      if (prefetchedSignatures.has(id)) return;
+      prefetchedSignatures.add(id);
+      prefetchSignature(id).then((image) => {
+        if (!image) prefetchedSignatures.delete(id);
+      });
     });
   }, [assigned, skipped, offline]);
 

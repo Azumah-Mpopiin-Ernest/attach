@@ -2,6 +2,7 @@ import hospitalLogo from "../hfch-logo.png?inline";
 import { jsPDF } from "jspdf";
 import { getDateKey, compareDateKeys } from "./referralDates";
 import JSZip from "jszip";
+import { getSignatureImage } from "./firebaseData";
 
 const FORM_WIDTH = 1600;
 const FORM_HEIGHT = 1067;
@@ -98,9 +99,27 @@ export async function renderReferralFormCanvas(
   row("Date:", formatDate(referral.referralDate), leftX, 735, 760);
   row("Date:", formatDate(referral.referralDate), rightX, 735, rightLineEnd);
 
+  const [fromSignature, toSignature] = await Promise.all([
+    signatureSource(
+      referral.referredFromSignatureUrl,
+      referral.referredFromSignatureId,
+    ),
+    signatureSource(
+      referral.referredToSignatureUrl,
+      referral.referredToSignatureId,
+    ),
+  ]);
+  if (
+    requireSignatures &&
+    ((referral.referredFromSignatureId && !fromSignature) ||
+      (referral.referredToSignatureId && !toSignature))
+  ) {
+    throw new Error(SIGNATURE_UNAVAILABLE);
+  }
+
   await drawSignature(
     context,
-    referral.referredFromSignatureUrl,
+    fromSignature,
     285,
     550,
     300,
@@ -109,7 +128,7 @@ export async function renderReferralFormCanvas(
   );
   await drawSignature(
     context,
-    referral.referredToSignatureUrl,
+    toSignature,
     1035,
     550,
     300,
@@ -347,6 +366,37 @@ function safeFileName(value) {
 // network error doesn't stick for the rest of the session.
 const imageCache = new Map();
 
+const SIGNATURE_UNAVAILABLE =
+  "A doctor's signature couldn't be loaded, so the form was not downloaded. Connect to the internet once so signatures are saved on this device, then try again.";
+
+// Signature id -> its image, looked up once per session. A failed or empty
+// lookup is not cached, so it is retried next time.
+const signatureCache = new Map();
+
+// Newer referrals point at a signature document (`id`); older ones carry the
+// image inline (`url`).
+function signatureSource(url, id) {
+  if (url) return Promise.resolve(url);
+  if (!id) return Promise.resolve(null);
+  if (!signatureCache.has(id)) {
+    signatureCache.set(
+      id,
+      getSignatureImage(id)
+        .catch(() => null)
+        .then((source) => {
+          if (!source) signatureCache.delete(id);
+          return source;
+        }),
+    );
+  }
+  return signatureCache.get(id);
+}
+
+// Loads a signature while online so it is cached for offline form downloads.
+export function prefetchSignature(id) {
+  return signatureSource(null, id);
+}
+
 function loadImage(source) {
   if (!source) return Promise.resolve(null);
   if (!imageCache.has(source)) {
@@ -380,9 +430,7 @@ async function drawSignature(
   const image = await loadImage(source);
   if (!image) {
     if (required) {
-      throw new Error(
-        "A doctor's signature couldn't be loaded, so the form was not downloaded. Connect to the internet once so signatures are saved on this device, then try again.",
-      );
+      throw new Error(SIGNATURE_UNAVAILABLE);
     }
     return;
   }

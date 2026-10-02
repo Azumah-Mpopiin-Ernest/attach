@@ -47,7 +47,7 @@ export default function LhimsRunBar({ lhims }) {
           {active ? (
             <p className="mt-0.5">
               {run.status === "STOPPING"
-                ? "Stopping after the current patient… "
+                ? "Stopping once the referrals being saved are confirmed… "
                 : "Running. "}
               Date {run.date} · tabs ready {pool?.ready ?? 0}/{pool?.total ?? 0}{" "}
               · done {run.done} · skipped {run.skipped}

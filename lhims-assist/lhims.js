@@ -38,11 +38,18 @@
     armedFor = null,
     activeJob = null;
 
+  // How long to wait for the patient to show up (dropdown, then results) before
+  // calling it NO_MATCH. A freshly recycled list tab can report "ready" before
+  // LHIMS has finished filling the dropdown/grid, so a single instant check
+  // produced false NO_MATCHes that grew as more tabs were recycled.
+  const MATCH_WAIT_MS = C.MATCH_WAIT_MS ?? 15000;
+
   class Problem extends Error {
-    constructor(stage, reason) {
+    constructor(stage, reason, detail = null) {
       super(reason);
       this.stage = stage;
       this.reason = reason;
+      this.detail = detail; // short diagnostic shown in the skip note
     }
   }
 
@@ -94,6 +101,36 @@
         attributes: true,
         characterData: true,
       });
+    });
+  // Like waitFor, but gives up after `ms` and resolves null. Also polls, since
+  // some LHIMS updates (e.g. select options set via script) may not mutate the DOM.
+  const waitUntil = (check, ms) =>
+    new Promise((resolve) => {
+      const v = check();
+      if (v) return resolve(v);
+      let finished = false;
+      const finish = (r) => {
+        if (finished) return;
+        finished = true;
+        mo.disconnect();
+        clearInterval(poll);
+        clearTimeout(timer);
+        resolve(r);
+      };
+      const tick = () => {
+        if (aborted) return finish(null);
+        const r = check();
+        if (r) finish(r);
+      };
+      const mo = new MutationObserver(tick);
+      mo.observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true,
+      });
+      const poll = setInterval(tick, 500);
+      const timer = setTimeout(() => finish(check() || null), ms);
     });
   const quietFor = (root, ms) =>
     new Promise((resolve) => {
@@ -249,11 +286,21 @@
     const sel = document.querySelector(S.list.patientSelect);
     if (!sel) throw new Problem("NEEDS_ATTENTION", "SELECTOR_patientSelect_0");
     const want = norm(job.patientId);
-    const opts = [...sel.options].filter((o) => {
-      const m = o.text.match(/\(([^()]+)\)\s*$/);
-      return m && norm(m[1]) === want;
-    });
-    if (opts.length === 0) throw new Problem("NEEDS_ATTENTION", "NO_MATCH");
+    const matching = () => {
+      const m = [...sel.options].filter((o) => {
+        const id = o.text.match(/\(([^()]+)\)\s*$/);
+        return id && norm(id[1]) === want;
+      });
+      return m.length ? m : null;
+    };
+    const opts = await waitUntil(matching, MATCH_WAIT_MS);
+    guard();
+    if (!opts)
+      throw new Problem(
+        "NEEDS_ATTENTION",
+        "NO_MATCH",
+        `not in dropdown (${sel.options.length} options)`,
+      );
     setNative(sel, opts[0].value); // duplicates in the dropdown: the first one is used
     if (sel.value !== opts[0].value)
       throw new Problem("NEEDS_ATTENTION", "SELECT_NOT_SET");
@@ -271,10 +318,26 @@
     await quietFor(grid, C.SETTLE_MS); // always: all result rows must be rendered before one is chosen
     guard();
 
-    const found = vis(S.list.patientLink, grid).filter(
-      (a) => norm(a.dataset.patientNo) === want,
-    );
-    if (found.length === 0) throw new Problem("NEEDS_ATTENTION", "NO_MATCH");
+    // re-query the grid each time: a search may replace the grid element
+    const currentGrid = () => document.querySelector(S.list.grid) || grid;
+    const matching = () => {
+      const f = vis(S.list.patientLink, currentGrid()).filter(
+        (a) => norm(a.dataset.patientNo) === want,
+      );
+      return f.length ? f : null;
+    };
+    // the results may still be loading when the grid first goes quiet
+    const hit = await waitUntil(matching, MATCH_WAIT_MS);
+    guard();
+    if (!hit)
+      throw new Problem(
+        "NEEDS_ATTENTION",
+        "NO_MATCH",
+        `not in results (${vis(S.list.patientLink, currentGrid()).length} rows shown)`,
+      );
+    await quietFor(currentGrid(), C.SETTLE_MS); // let the rest of this patient's rows render too
+    guard();
+    const found = matching() || hit;
     const rows = found
       .map((a) => {
         const block = a.closest(S.list.rowBlock);
@@ -293,15 +356,20 @@
       ),
     );
 
-    let pick,
-      how = "";
-    if (rows.length === 1) pick = rows[0];
-    else {
-      const open = rows.filter((r) => r.color !== "red" && r.color !== "green");
-      pick = open.find((r) => r.color === "yellow") || open[0];
-      if (!pick) throw new Problem("NEEDS_ATTENTION", "NO_USABLE_ROW");
-      how = `${rows.length} visits found; used the ${pick.color === "yellow" ? "yellow" : "first"} one`;
-    }
+    // Red and green visits are never used, even when they are the only one:
+    // the app marks a referral with no usable visit as done.
+    const open = rows.filter((r) => r.color !== "red" && r.color !== "green");
+    const pick = open.find((r) => r.color === "yellow") || open[0];
+    if (!pick)
+      throw new Problem(
+        "NEEDS_ATTENTION",
+        "NO_USABLE_ROW",
+        rows.map((r) => r.color).join(","),
+      );
+    const how =
+      rows.length > 1
+        ? `${rows.length} visits found; used the ${pick.color === "yellow" ? "yellow" : "first"} one`
+        : "";
 
     const icon = one("updateIcon", S.list.updateIcon, pick.block); // this row only
     const sid = (icon.getAttribute("onclick") || "").match(
@@ -556,7 +624,13 @@
       );
 
       let warn = null;
-      const mode = job.auto ? "strict" : C.VERIFY_BYTES;
+      // Auto runs download the stored file for a sample of saves only (see
+      // VERIFY_BYTES_FIRST/EVERY); the new-attachment count above always applies.
+      const mode = job.auto
+        ? job.verifyBytes
+          ? "strict"
+          : "off"
+        : C.VERIFY_BYTES;
       if (mode !== "off") {
         const size = await fetchSize(target.href);
         dbg("stored size", size, "sent size", job.size);
@@ -631,7 +705,10 @@
       await sw({
         type: "PROGRESS",
         stage: p.stage,
-        patch: { reason: p.reason },
+        patch: {
+          reason: p.reason,
+          ...(p.detail ? { warn: String(p.detail).slice(0, 100) } : {}),
+        },
       });
     } catch {
       /* SW gone */

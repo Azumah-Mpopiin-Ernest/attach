@@ -839,3 +839,55 @@ export async function clearImportBatchFileNames() {
     invalidateDocument(IMPORT_BATCH_COLLECTION, IMPORT_BATCH_DOC_ID);
   }
 }
+
+// ---------------------------------------------------------------------------
+// DOCTOR SIGNATURES
+//
+// A signature image is stored ONCE, in signatures/{doctorUid}_{hash}, and
+// referrals point at it (referredFromSignatureId / referredToSignatureId)
+// instead of each carrying a copy of the image. Bulk signing then writes a
+// short id per referral rather than up to ~700 KB.
+//
+// The id comes from the image itself, so signing again with the same
+// signature reuses the same document, while a redrawn signature gets a new
+// one: forms that were already signed keep the signature they were signed
+// with. Signature documents are never updated or deleted.
+//
+// Referrals signed before this change still carry the image inline
+// (referredFromSignatureUrl / referredToSignatureUrl); the form renderer
+// accepts either.
+// ---------------------------------------------------------------------------
+async function signatureIdFor(doctorId, dataUrl) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(dataUrl),
+  );
+  const hex = [...new Uint8Array(digest)]
+    .slice(0, 8)
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return `${doctorId}_${hex}`;
+}
+
+// Makes sure the doctor's current signature has its own document and
+// returns its id. One read, plus one write the first time a signature is used.
+export async function ensureSignatureDocument(doctorId, dataUrl) {
+  if (!db) throw new Error("Firebase is not configured.");
+  if (!doctorId || !dataUrl) throw new Error("No signature to save.");
+  const signatureId = await signatureIdFor(doctorId, dataUrl);
+  const ref = doc(db, "signatures", signatureId);
+  try {
+    const snapshot = await getDoc(ref);
+    if (!snapshot.exists())
+      await setDoc(ref, { doctorId, dataUrl, createdAt: new Date() });
+  } catch (error) {
+    throw tagQuotaError(error);
+  }
+  return signatureId;
+}
+
+// The signature image (a data URL) for a signature id, or null if missing.
+export async function getSignatureImage(signatureId) {
+  const signature = await getDocument("signatures", signatureId);
+  return signature?.dataUrl ?? null;
+}

@@ -29,6 +29,8 @@ const NO_BREAKER = new Set([
   "NO_USABLE_ROW",
   "ALREADY_ATTACHED",
 ]);
+// Outcomes the app marks done instead of skipping (keep in sync with src/lhims/useLhimsRun.js).
+const MARK_DONE = new Set(["ALREADY_ATTACHED", "NO_USABLE_ROW"]);
 const PATCH_KEYS = [
   "reason",
   "scheduleId",
@@ -41,6 +43,16 @@ const DEFAULT_BREAKER = { fails: 0, tripped: false };
 const DATE_RE = /^\d{2}-\d{2}-\d{4}$/;
 const ACTIVE = (r) =>
   !!r && (r.status === "RUNNING" || r.status === "STOPPING");
+
+// An auto run works on up to CONCURRENCY referrals at once, each in its own
+// pool tab. Manual mode always has at most one job.
+const CONCURRENCY = Math.max(1, A.CONCURRENCY ?? 1);
+// Auto runs check the stored file's bytes for the first few saves of a run and
+// then on a sample; every save still has its new attachment counted.
+const VERIFY_BYTES_FIRST = A.VERIFY_BYTES_FIRST ?? 5;
+const VERIFY_BYTES_EVERY = A.VERIFY_BYTES_EVERY ?? 10;
+// Finished jobs kept so a reloading app still sees their outcome.
+const KEEP_FINISHED = 30;
 
 const toRegex = (p) =>
   new RegExp(
@@ -86,6 +98,47 @@ const shapeOf = (fileName) =>
     .map((w) => w[0] + "•".repeat(Math.max(0, w.length - 1)))
     .join(" ");
 
+// ---------- jobs (stored as { [jobId]: job }) ----------
+const blobKey = (jobId) => `blob:${jobId}`;
+const WD_PREFIX = "wd:";
+const readJobs = () => read("jobs", {});
+const isLive = (j) => !TERMINAL.has(j.stage);
+const liveAuto = (jobs) =>
+  Object.values(jobs).filter((j) => j.auto && isLive(j));
+const newestFirst = (list) =>
+  [...list].sort((a, b) => b.updatedAt - a.updatedAt);
+const manualJob = (jobs) =>
+  newestFirst(Object.values(jobs).filter((j) => !j.auto))[0] || null;
+const liveJobOfTab = (jobs, tabId) =>
+  Object.values(jobs).find((j) => j.claimedTabId === tabId && isLive(j)) ||
+  null;
+// What one LHIMS tab shows: the job it is working on, else the manual job.
+const jobForTab = (jobs, tabId) =>
+  liveJobOfTab(jobs, tabId) || manualJob(jobs);
+// What the app shows at the top level (manual cards); auto runs read `jobs`.
+const jobForApp = (jobs) =>
+  manualJob(jobs) || newestFirst(Object.values(jobs))[0] || null;
+
+async function removeJobs(ids) {
+  if (!ids.length) return;
+  const jobs = await readJobs();
+  for (const id of ids) delete jobs[id];
+  await store.set({ jobs });
+  await store.remove(ids.map(blobKey));
+  await Promise.all(ids.map((id) => chrome.alarms.clear(WD_PREFIX + id)));
+}
+
+async function clearAllJobs() {
+  await removeJobs(Object.keys(await readJobs()));
+}
+
+// Drops the oldest finished jobs beyond KEEP_FINISHED.
+function pruneFinished(jobs) {
+  const finished = newestFirst(Object.values(jobs).filter((j) => !isLive(j)));
+  for (const j of finished.slice(KEEP_FINISHED)) delete jobs[j.jobId];
+  return jobs;
+}
+
 // ---------- state shown to the app and the badges ----------
 const publicRun = (r) =>
   r
@@ -95,26 +148,27 @@ const publicRun = (r) =>
         done: r.done,
         skipped: r.skipped,
         stopReason: r.stopReason || null,
+        concurrency: CONCURRENCY,
       }
     : null;
 const poolStats = (p) => {
   const v = Object.values(p || {});
   return { total: v.length, ready: v.filter((x) => x.ready).length };
 };
-const publicState = (job, breaker, run, pool) => ({
-  ...(job
-    ? {
-        referralId: job.referralId,
-        stage: job.stage,
-        reason: job.reason || null,
-        warn: job.warn || null,
-        verified: job.stage === "VERIFIED",
-        patientId: job.patientId,
-        shape: job.shape,
-        claimedTabId: job.claimedTabId ?? null,
-        auto: !!job.auto,
-      }
-    : { stage: "IDLE" }),
+const publicJob = (job) => ({
+  referralId: job.referralId,
+  stage: job.stage,
+  reason: job.reason || null,
+  warn: job.warn || null,
+  verified: job.stage === "VERIFIED",
+  patientId: job.patientId,
+  shape: job.shape,
+  claimedTabId: job.claimedTabId ?? null,
+  auto: !!job.auto,
+});
+const publicState = (job, breaker, run, pool, jobs = null) => ({
+  ...(job ? publicJob(job) : { stage: "IDLE" }),
+  ...(jobs ? { jobs: newestFirst(Object.values(jobs)).map(publicJob) } : {}),
   breaker,
   run: publicRun(run),
   pool: poolStats(pool),
@@ -130,22 +184,40 @@ const ownerJob = (j) => ({
   baseline: j.baseline ?? null,
   fieldsOk: j.fieldsOk ?? null,
   auto: !!j.auto,
+  verifyBytes: j.verifyBytes !== false,
   date: j.date ?? null,
 });
-const snapshot = async (job) =>
-  publicState(
-    job,
-    await read("breaker", DEFAULT_BREAKER),
-    await read("run"),
-    await read("pool", {}),
-  );
+const common = async () => ({
+  jobs: await readJobs(),
+  breaker: await read("breaker", DEFAULT_BREAKER),
+  run: await read("run"),
+  pool: await read("pool", {}),
+});
+const appState = async () => {
+  const s = await common();
+  return publicState(jobForApp(s.jobs), s.breaker, s.run, s.pool, s.jobs);
+};
+const tabState = async (tabId) => {
+  const s = await common();
+  return publicState(jobForTab(s.jobs, tabId), s.breaker, s.run, s.pool);
+};
 
-async function broadcast(job) {
-  const state = await snapshot(job);
+async function broadcast() {
+  const s = await common();
   const appTab = await read("appTab");
   if (appTab != null)
     chrome.tabs
-      .sendMessage(appTab, { channel: "TO_APP", type: "STATE", state })
+      .sendMessage(appTab, {
+        channel: "TO_APP",
+        type: "STATE",
+        state: publicState(
+          jobForApp(s.jobs),
+          s.breaker,
+          s.run,
+          s.pool,
+          s.jobs,
+        ),
+      })
       .catch(() => {});
   const tabs = await read("tabs", []);
   const alive = [];
@@ -155,7 +227,7 @@ async function broadcast(job) {
         await chrome.tabs.sendMessage(id, {
           channel: "TO_LHIMS",
           type: "STATE",
-          state,
+          state: publicState(jobForTab(s.jobs, id), s.breaker, s.run, s.pool),
         });
         alive.push(id);
       } catch {
@@ -168,17 +240,18 @@ async function broadcast(job) {
 
 // ---------- per-job watchdog ----------
 async function arm(job) {
+  const name = WD_PREFIX + job.jobId;
   if (job.stage === "JOB_RECEIVED" || job.stage === "READY_FOR_SAVE")
-    return chrome.alarms.clear("wd");
-  return chrome.alarms.create("wd", {
+    return chrome.alarms.clear(name);
+  return chrome.alarms.create(name, {
     delayInMinutes:
       job.stage === "SAVE_CLICKED" ? C.VERIFY_TIMEOUT_MIN : C.STAGE_TIMEOUT_MIN,
   });
 }
 
 async function onTerminal(job) {
-  await store.remove("blob"); // bytes never outlive the job
-  await chrome.alarms.clear("wd");
+  await store.remove(blobKey(job.jobId)); // bytes never outlive the job
+  await chrome.alarms.clear(WD_PREFIX + job.jobId);
   if (job.auto) return; // auto runs use the consecutive-problem limit (afterTerminal) instead of the breaker
   const b = await read("breaker", DEFAULT_BREAKER);
   if (job.stage === "VERIFIED") b.fails = 0;
@@ -206,33 +279,35 @@ const cleanPatch = (patch) => {
 };
 
 async function transition(jobId, stage, patch = {}, force = false) {
-  const job = await read("job");
-  if (!job || job.jobId !== jobId) return null;
+  const jobs = await readJobs();
+  const job = jobs[jobId];
+  if (!job) return null;
   if (TERMINAL.has(job.stage) && !force) return null;
   const clean = cleanPatch(patch);
   const next = { ...job, ...clean, stage, updatedAt: Date.now() };
   if (!("reason" in clean)) next.reason = null;
-  await store.set({ job: next });
+  // a problem's diagnostic must not inherit an earlier stage's note (e.g. "2 visits found")
+  if (TERMINAL.has(stage) && stage !== "VERIFIED" && !("warn" in clean))
+    next.warn = null;
+  jobs[jobId] = next;
+  await store.set({ jobs });
   if (TERMINAL.has(stage)) {
     await onTerminal(next);
     await afterTerminal(next);
   } else await arm(next);
-  await broadcast(next);
+  await broadcast();
   return next;
-}
-
-async function clearJob() {
-  await store.remove(["job", "blob"]);
-  await chrome.alarms.clear("wd");
-  await broadcast(null);
 }
 
 // ---------- auto-run: tab pool ----------
 async function poolFill() {
   const run = await read("run");
   if (run?.status !== "RUNNING") return;
-  const job = await read("job");
-  const inUse = job && !TERMINAL.has(job.stage) ? job.claimedTabId : null;
+  const inUse = new Set(
+    liveAuto(await readJobs())
+      .map((j) => j.claimedTabId)
+      .filter((id) => id != null),
+  );
   const old = await read("pool", {});
   const pool = {};
   for (const [id, p] of Object.entries(old)) {
@@ -241,7 +316,7 @@ async function poolFill() {
     } catch {
       continue;
     } // tab is gone
-    if (Number(id) !== inUse && p.date !== run.date) {
+    if (!inUse.has(Number(id)) && p.date !== run.date) {
       pool[id] = { date: run.date, ready: false };
       chrome.tabs
         .update(Number(id), { url: listUrl(run, run.date) })
@@ -271,31 +346,37 @@ async function poolFill() {
 }
 
 async function assign() {
-  // hand a waiting auto job to a ready tab
-  const job = await read("job"),
-    run = await read("run"),
-    pool = await read("pool", {});
-  if (
-    run?.status !== "RUNNING" ||
-    !job ||
-    !job.auto ||
-    job.stage !== "JOB_RECEIVED" ||
-    job.claimedTabId != null
-  )
-    return;
-  const entry = Object.entries(pool).find(
-    ([, p]) => p.ready && !p.busy && p.date === job.date,
-  );
-  if (!entry) return;
-  const tabId = Number(entry[0]);
-  pool[tabId] = { ...entry[1], ready: false, busy: true };
-  await store.set({ pool, job: { ...job, claimedTabId: tabId } });
-  await transition(job.jobId, "TAB_CLAIMED");
-  if (A.ACTIVATE_TAB)
-    chrome.tabs.update(tabId, { active: true }).catch(() => {});
-  chrome.tabs
-    .sendMessage(tabId, { channel: "TO_LHIMS", type: "AUTO_GO" })
-    .catch(() => {});
+  // hand each waiting auto job to its own ready tab
+  const run = await read("run");
+  if (run?.status !== "RUNNING") return;
+  const jobs = await readJobs();
+  const pool = await read("pool", {});
+  const waiting = Object.values(jobs)
+    .filter(
+      (j) => j.auto && j.stage === "JOB_RECEIVED" && j.claimedTabId == null,
+    )
+    .sort((a, b) => a.updatedAt - b.updatedAt);
+  const claimed = [];
+  for (const job of waiting) {
+    const entry = Object.entries(pool).find(
+      ([, p]) => p.ready && !p.busy && p.date === job.date,
+    );
+    if (!entry) continue;
+    const tabId = Number(entry[0]);
+    pool[tabId] = { ...entry[1], ready: false, busy: true };
+    jobs[job.jobId] = { ...job, claimedTabId: tabId };
+    claimed.push([job.jobId, tabId]);
+  }
+  if (!claimed.length) return;
+  await store.set({ pool, jobs });
+  for (const [jobId, tabId] of claimed) {
+    await transition(jobId, "TAB_CLAIMED");
+    if (A.ACTIVATE_TAB)
+      chrome.tabs.update(tabId, { active: true }).catch(() => {});
+    chrome.tabs
+      .sendMessage(tabId, { channel: "TO_LHIMS", type: "AUTO_GO" })
+      .catch(() => {});
+  }
 }
 
 async function recycle(tabId, run) {
@@ -313,24 +394,30 @@ async function recycle(tabId, run) {
 async function afterTerminal(job) {
   const run = await read("run");
   if (!job.auto || !ACTIVE(run)) return;
-  if (HARD_STOP.has(job.stage)) return finishRun(job.reason || job.stage, true); // referral stays in the queue
-  const verified = job.stage === "VERIFIED";
+  if (HARD_STOP.has(job.stage)) return stopRun(job.reason || job.stage, true); // referral stays in the queue
+  const done =
+    job.stage === "VERIFIED" ||
+    (job.stage === "NEEDS_ATTENTION" && MARK_DONE.has(job.reason));
   const benign = BENIGN.has(job.reason);
   const next = {
     ...run,
-    done: run.done + (verified ? 1 : 0),
-    skipped: run.skipped + (verified ? 0 : 1),
-    problems: verified
+    done: run.done + (done ? 1 : 0),
+    skipped: run.skipped + (done ? 0 : 1),
+    problems: done
       ? 0
       : benign
         ? run.problems || 0
         : (run.problems || 0) + 1,
   };
   await store.set({ run: next });
+  if (next.status === "STOPPING") {
+    // finish once the last job past Save has been verified
+    if (!liveAuto(await readJobs()).length)
+      await finishRun(next.stopReason || "OFFICER_STOP", !!next.keepPool);
+    return;
+  }
   if (next.problems >= A.MAX_CONSECUTIVE_PROBLEMS)
-    return finishRun("TOO_MANY_PROBLEMS", true);
-  if (run.status === "STOPPING")
-    return finishRun(run.stopReason || "OFFICER_STOP", false);
+    return stopRun("TOO_MANY_PROBLEMS", true);
   await recycle(job.claimedTabId, next);
 }
 
@@ -348,21 +435,29 @@ async function finishRun(reason, keepPool) {
     pool,
     run: { ...run, status: "STOPPED", stopReason: reason },
   });
-  await broadcast(await read("job"));
+  await broadcast();
 }
 
 async function stopRun(reason, keepPool = false) {
   const run = await read("run");
   if (!ACTIVE(run)) return;
-  const job = await read("job");
-  if (job?.auto && job.stage === "SAVE_CLICKED") {
-    // past the point of no return: finish verifying this one
+  const live = liveAuto(await readJobs());
+  // cancel everything before Save: nothing is written
+  await removeJobs(
+    live.filter((j) => j.stage !== "SAVE_CLICKED").map((j) => j.jobId),
+  );
+  if (live.some((j) => j.stage === "SAVE_CLICKED")) {
+    // past the point of no return: finish verifying those first
     await store.set({
-      run: { ...run, status: "STOPPING", stopReason: reason },
+      run: {
+        ...run,
+        status: "STOPPING",
+        stopReason: run.status === "STOPPING" ? run.stopReason : reason,
+        keepPool: keepPool || !!run.keepPool,
+      },
     });
-    return broadcast(job);
+    return broadcast();
   }
-  if (job?.auto && !TERMINAL.has(job.stage)) await clearJob(); // cancel before Save: nothing is written
   return finishRun(reason, keepPool);
 }
 
@@ -405,23 +500,41 @@ function validate(p, auto) {
   return null;
 }
 
-async function submit(p, job, breaker) {
+async function submit(p, breaker) {
   if (breaker.tripped) return { ok: false, error: "BREAKER_TRIPPED" };
-  const run = await read("run");
+  let run = await read("run");
   if (run?.status === "STOPPING") return { ok: false, error: "RUN_STOPPING" };
   const auto = run?.status === "RUNNING";
   const bad = validate(p, auto);
   if (bad) return { ok: false, error: bad };
-  if (
-    job &&
-    job.referralId === p.referralId &&
-    (!TERMINAL.has(job.stage) || !p.retry)
-  )
-    return { ok: true, state: await snapshot(job) };
+  let jobs = await readJobs();
+  const existing = newestFirst(
+    Object.values(jobs).filter((j) => j.referralId === p.referralId),
+  )[0];
+  if (existing && (isLive(existing) || !p.retry))
+    return { ok: true, state: await appState() };
+  if (auto && liveAuto(jobs).length >= CONCURRENCY)
+    return { ok: false, error: "BUSY" };
   const bytes = decode(p.bytesB64);
   if (bytes.length !== p.size) return { ok: false, error: "SIZE_MISMATCH" };
   if (p.sha256 && (await sha256Hex(bytes)) !== p.sha256)
     return { ok: false, error: "HASH_MISMATCH" };
+
+  if (!auto) {
+    // manual mode keeps a single job: a new one replaces the previous one
+    await removeJobs(
+      Object.values(jobs)
+        .filter((j) => !j.auto)
+        .map((j) => j.jobId),
+    );
+    jobs = await readJobs();
+  }
+  let verifyBytes = true;
+  if (auto) {
+    const n = run.submitted || 0;
+    verifyBytes = n < VERIFY_BYTES_FIRST || n % VERIFY_BYTES_EVERY === 0;
+    run = { ...run, submitted: n + 1 };
+  }
   const next = {
     jobId: crypto.randomUUID(),
     referralId: p.referralId,
@@ -431,34 +544,36 @@ async function submit(p, job, breaker) {
     size: p.size,
     shape: shapeOf(p.expectedFileName),
     auto,
+    verifyBytes,
     date: auto ? p.date : null,
     claimedTabId: null,
     stage: "JOB_RECEIVED",
     reason: null,
     updatedAt: Date.now(),
   };
+  jobs[next.jobId] = next;
   await store.set({
-    job: next,
-    blob: { b64: p.bytesB64, mimeType: p.mimeType },
+    jobs: pruneFinished(jobs),
+    [blobKey(next.jobId)]: { b64: p.bytesB64, mimeType: p.mimeType },
   });
-  await chrome.alarms.clear("wd");
-  if (auto && run.date !== p.date) {
+  if (auto) {
+    const dateChanged = run.date !== p.date;
     await store.set({ run: { ...run, date: p.date } });
-    await poolFill();
+    if (dateChanged) await poolFill();
   }
-  await broadcast(next);
+  await broadcast();
   if (auto) await assign();
-  return { ok: true, state: await snapshot(await read("job")) };
+  return { ok: true, state: await appState() };
 }
 
-async function startRun(p, sender, job, breaker, run) {
+async function startRun(p, sender, breaker, run) {
   if (ACTIVE(run)) return { ok: false, error: "ALREADY_RUNNING" };
   if (breaker.tripped) return { ok: false, error: "BREAKER_TRIPPED" };
   const ps = await read("pendingStart");
   if (!ps || Date.now() - ps.at > 120000)
     return { ok: false, error: "NO_START_REQUEST" };
   if (!DATE_RE.test(p.date || "")) return { ok: false, error: "BAD_DATE" };
-  if (job) await clearJob(); // starting is the officer's acknowledgement of any earlier problem
+  await clearAllJobs(); // starting is the officer's acknowledgement of any earlier problem
   await store.remove("pendingStart");
   await store.set({
     run: {
@@ -469,6 +584,7 @@ async function startRun(p, sender, job, breaker, run) {
       done: 0,
       skipped: 0,
       problems: 0,
+      submitted: 0,
       stopReason: null,
       startedAt: Date.now(),
     },
@@ -480,13 +596,12 @@ async function startRun(p, sender, job, breaker, run) {
   });
   chrome.tabs.update(sender.tab.id, { autoDiscardable: false }).catch(() => {});
   await poolFill();
-  await broadcast(null);
+  await broadcast();
   return { ok: true };
 }
 
 async function onApp(msg, sender) {
   await store.set({ appTab: sender.tab.id });
-  const job = await read("job");
   const breaker = await read("breaker", DEFAULT_BREAKER);
   const run = await read("run");
   const p = msg.payload || {};
@@ -494,19 +609,27 @@ async function onApp(msg, sender) {
     case "PING":
       return { pong: true, version: chrome.runtime.getManifest().version };
     case "GET_STATE":
-      return snapshot(job);
+      return appState();
     case "ACK_BREAKER":
       await store.set({ breaker: { ...DEFAULT_BREAKER } });
-      await broadcast(job);
+      await broadcast();
       return { ok: true };
-    case "CANCEL_JOB":
-      if (job && job.referralId === p.referralId && !(job.auto && ACTIVE(run)))
-        await clearJob();
+    case "CANCEL_JOB": {
+      const autoActive = ACTIVE(run);
+      await removeJobs(
+        Object.values(await readJobs())
+          .filter(
+            (j) => j.referralId === p.referralId && !(j.auto && autoActive),
+          )
+          .map((j) => j.jobId),
+      );
+      await broadcast();
       return { ok: true };
+    }
     case "SUBMIT_JOB":
-      return submit(p, job, breaker);
+      return submit(p, breaker);
     case "RUN_START":
-      return startRun(p, sender, job, breaker, run);
+      return startRun(p, sender, breaker, run);
     case "RUN_STOP":
       await stopRun(String(p.reason || "OFFICER_STOP").slice(0, 40));
       return { ok: true };
@@ -518,11 +641,10 @@ async function onApp(msg, sender) {
 // ---------- messages from LHIMS tabs ----------
 async function onLhims(msg, sender) {
   const tabId = sender.tab.id;
-  const job = await read("job");
   const run = await read("run");
-  const owner = !!job && job.claimedTabId === tabId;
+  const job = liveJobOfTab(await readJobs(), tabId); // the job this tab owns
   const view = async (j) => ({
-    state: await snapshot(j),
+    state: await tabState(tabId),
     job: j && j.claimedTabId === tabId ? ownerJob(j) : undefined,
   });
 
@@ -545,22 +667,29 @@ async function onLhims(msg, sender) {
         await store.set({ pool });
         await assign();
       }
-      return { ok: true, tabId, ...(await view(await read("job"))) };
+      return {
+        ok: true,
+        tabId,
+        ...(await view(jobForTab(await readJobs(), tabId))),
+      };
     }
     case "CLAIM": {
       if (ACTIVE(run)) return { ok: false, error: "RUN_ACTIVE" };
-      if (!job || job.stage !== "JOB_RECEIVED" || job.claimedTabId != null)
+      const jobs = await readJobs();
+      const m = manualJob(jobs);
+      if (!m || m.stage !== "JOB_RECEIVED" || m.claimedTabId != null)
         return { ok: false, error: "NOT_CLAIMABLE" };
       if (msg.page !== "LIST")
         return { ok: false, error: "NOT_A_PATIENT_LIST_TAB" };
-      await store.set({ job: { ...job, claimedTabId: tabId } });
-      const next = await transition(job.jobId, "TAB_CLAIMED");
+      jobs[m.jobId] = { ...m, claimedTabId: tabId };
+      await store.set({ jobs });
+      const next = await transition(m.jobId, "TAB_CLAIMED");
       return next
         ? { ok: true, ...(await view(next)) }
         : { ok: false, error: "IGNORED" };
     }
     case "PROGRESS": {
-      if (!owner || !REPORTABLE.has(msg.stage))
+      if (!job || !REPORTABLE.has(msg.stage))
         return { ok: false, error: "REJECTED" };
       const next = await transition(job.jobId, msg.stage, msg.patch || {});
       return next
@@ -568,13 +697,21 @@ async function onLhims(msg, sender) {
         : { ok: false, error: "IGNORED" };
     }
     case "SAVE_CLICKED": {
+      // UNVERIFIED is terminal, so look past liveJobOfTab for a manual re-save
+      const own =
+        job ||
+        newestFirst(
+          Object.values(await readJobs()).filter(
+            (j) => j.claimedTabId === tabId && j.stage === "UNVERIFIED",
+          ),
+        )[0];
       if (
-        !owner ||
-        !["READY_FOR_SAVE", "SAVE_CLICKED", "UNVERIFIED"].includes(job.stage)
+        !own ||
+        !["READY_FOR_SAVE", "SAVE_CLICKED", "UNVERIFIED"].includes(own.stage)
       )
         return { ok: false, error: "REJECTED" };
       const next = await transition(
-        job.jobId,
+        own.jobId,
         "SAVE_CLICKED",
         { fieldsOk: msg.fieldsOk ?? null },
         true,
@@ -584,9 +721,8 @@ async function onLhims(msg, sender) {
         : { ok: false, error: "IGNORED" };
     }
     case "GET_BLOB": {
-      if (!owner || TERMINAL.has(job.stage))
-        return { ok: false, error: "REJECTED" };
-      const blob = await read("blob");
+      if (!job) return { ok: false, error: "REJECTED" };
+      const blob = await read(blobKey(job.jobId));
       return blob
         ? { ok: true, b64: blob.b64, mimeType: blob.mimeType, size: job.size }
         : { ok: false, error: "NO_BLOB" };
@@ -636,12 +772,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 chrome.alarms.onAlarm.addListener((a) => {
-  if (a.name === "wd") {
+  if (a.name.startsWith(WD_PREFIX)) {
+    const jobId = a.name.slice(WD_PREFIX.length);
     locked(async () => {
-      const job = await read("job");
-      if (!job || TERMINAL.has(job.stage)) return;
+      const job = (await readJobs())[jobId];
+      if (!job || !isLive(job)) return;
       await transition(
-        job.jobId,
+        jobId,
         job.stage === "SAVE_CLICKED" ? "UNVERIFIED" : "NEEDS_ATTENTION",
         { reason: "TIMEOUT" },
       );
@@ -650,7 +787,7 @@ chrome.alarms.onAlarm.addListener((a) => {
     locked(async () => {
       const run = await read("run");
       if (run?.status !== "RUNNING") return;
-      const job = await read("job");
+      const live = liveAuto(await readJobs());
       const appTab = await read("appTab");
       let appAlive = appTab != null;
       if (appAlive) {
@@ -660,12 +797,14 @@ chrome.alarms.onAlarm.addListener((a) => {
           appAlive = false;
         }
       }
-      if (!appAlive && job?.stage !== "SAVE_CLICKED")
+      if (!appAlive && !live.some((j) => j.stage === "SAVE_CLICKED"))
         return stopRun("APP_CLOSED", true);
       if (
-        job?.auto &&
-        job.stage === "JOB_RECEIVED" &&
-        Date.now() - job.updatedAt > A.READY_TAB_TIMEOUT_MIN * 60000
+        live.some(
+          (j) =>
+            j.stage === "JOB_RECEIVED" &&
+            Date.now() - j.updatedAt > A.READY_TAB_TIMEOUT_MIN * 60000,
+        )
       )
         return stopRun("NO_READY_TAB", true);
       await poolFill();
@@ -684,8 +823,8 @@ chrome.tabs.onRemoved.addListener((tabId) =>
       delete pool[tabId];
       await store.set({ pool });
     }
-    const job = await read("job");
-    if (job && job.claimedTabId === tabId && !TERMINAL.has(job.stage))
+    const job = liveJobOfTab(await readJobs(), tabId);
+    if (job)
       await transition(
         job.jobId,
         job.stage === "SAVE_CLICKED" ? "UNVERIFIED" : "NEEDS_ATTENTION",

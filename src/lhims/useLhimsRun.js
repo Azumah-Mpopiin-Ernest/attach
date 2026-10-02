@@ -14,6 +14,9 @@ const TERMINAL = new Set([
 ]);
 // These stop the whole run and leave the referral in the queue (every following referral would fail the same way).
 const HARD_STOPS = new Set(["LOGGED_OUT", "EXTENSION_ERROR"]);
+// Nothing left to attach: the visit already has the form, or every matching visit is red/green.
+// Marked done instead of skipped (keep in sync with MARK_DONE in lhims-assist/sw.js).
+const MARK_DONE = new Set(["ALREADY_ATTACHED", "NO_USABLE_ROW"]);
 const BAD_DATA = new Set(["BAD_PATIENT_ID", "BAD_FILE_NAME"]); // this referral cannot be automated: skip it, keep going
 const START_ERRORS = {
   NO_START_REQUEST:
@@ -32,11 +35,18 @@ function toLhimsDate(key) {
   return m ? key : null;
 }
 
+// How many upcoming referrals have their form prepared in advance.
+const PREBUILD_AHEAD = 2;
+
 /**
  * Drives the extension's auto run from the officer's queue:
- * sends the next referral's form, marks it done once LHIMS verified it, and
- * SKIPS (with the reason) any referral that ends in a problem, so one bad
- * referral never holds up the rest. Stops when the queue is empty.
+ * sends up to `run.concurrency` referrals at once (each worked in its own
+ * LHIMS tab), marks each done once LHIMS verified it, and SKIPS (with the
+ * reason) any referral that ends in a problem, so one bad referral never
+ * holds up the rest. Stops when the queue is empty.
+ *
+ * Forms are rendered ahead of time, so the next referral is sent the moment
+ * a slot frees up.
  *
  * `skipReferral(referral, note)` must store the note for the skipped list.
  */
@@ -49,14 +59,28 @@ export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
     breaker: { fails: 0, tripped: false },
   });
   const [startError, setStartError] = useState("");
+  const [tick, setTick] = useState(0); // re-runs the driver after each send
   const queueRef = useRef(queue);
   const actionsRef = useRef({ markDone, skipReferral });
-  const processed = useRef(new Set());
+  const processed = useRef(new Set()); // referral ids with a final outcome
+  const submitted = useRef(new Map()); // referral id -> LHIMS date, sent during this run
+  const prebuilt = useRef(new Map()); // referral id -> Promise<job>
   const busy = useRef(false);
   useEffect(() => {
     queueRef.current = queue;
     actionsRef.current = { markDone, skipReferral };
   });
+
+  // Starts rendering a referral's form (once) and returns the pending job.
+  const jobFor = useCallback((referral) => {
+    let pending = prebuilt.current.get(referral.id);
+    if (!pending) {
+      pending = buildJob(referral);
+      prebuilt.current.set(referral.id, pending);
+      pending.catch(() => prebuilt.current.delete(referral.id)); // retried next time
+    }
+    return pending;
+  }, []);
 
   const startRun = useCallback(async () => {
     setStartError("");
@@ -109,63 +133,100 @@ export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
     };
   }, [startRun]);
 
-  // outcome of the current auto job: done on VERIFIED, otherwise skip with the reason
+  // outcome of each auto job: done on VERIFIED (or nothing left to attach), otherwise skip with the reason
   useEffect(() => {
-    const id = ext.referralId;
-    if (
-      !ext.auto ||
-      !id ||
-      processed.current.has(id) ||
-      !TERMINAL.has(ext.stage)
-    )
-      return;
-    const referral = queueRef.current.find((r) => r.id === id);
-    if (!referral) return;
-    if (ext.stage === "VERIFIED") {
-      processed.current.add(id);
-      actionsRef.current.markDone(referral);
-    } else if (!HARD_STOPS.has(ext.stage)) {
-      processed.current.add(id);
-      actionsRef.current.skipReferral(
-        referral,
-        describeProblem(ext.stage, ext.reason),
-      );
+    for (const job of ext.jobs ?? []) {
+      const id = job.referralId;
+      if (
+        !job.auto ||
+        !id ||
+        processed.current.has(id) ||
+        !TERMINAL.has(job.stage)
+      )
+        continue;
+      const referral = queueRef.current.find((r) => r.id === id);
+      if (!referral) continue;
+      if (
+        job.stage === "VERIFIED" ||
+        (job.stage === "NEEDS_ATTENTION" && MARK_DONE.has(job.reason))
+      ) {
+        processed.current.add(id);
+        actionsRef.current.markDone(referral);
+      } else if (!HARD_STOPS.has(job.stage)) {
+        processed.current.add(id);
+        actionsRef.current.skipReferral(
+          referral,
+          describeProblem(job.stage, job.reason, job.warn),
+        );
+      }
+      prebuilt.current.delete(id);
     }
   }, [ext]);
 
-  // driver: send the next referral, or stop when nothing is left
+  // driver: keep up to `concurrency` referrals in flight, or stop when nothing is left
   useEffect(() => {
-    if (
-      !present ||
-      !queueLoaded ||
-      ext.run?.status !== "RUNNING" ||
-      busy.current
-    )
-      return;
-    if (ext.referralId && !TERMINAL.has(ext.stage)) return; // a job is in progress
-    const next = queue.find((r) => !processed.current.has(r.id));
+    const running = ext.run?.status === "RUNNING";
+    if (!ext.run || ext.run.status === "STOPPED") {
+      // anything sent but not finished goes back to the queue for the next run
+      submitted.current.clear();
+      prebuilt.current.clear();
+    }
+    if (!present || !queueLoaded || !running || busy.current) return;
+
     const stop = (reason) => request("RUN_STOP", { reason }).catch(() => {});
-    if (!next) {
-      stop("DONE");
+    // a finished job frees its slot even if its referral left the queue meanwhile
+    const finished = new Set(
+      (ext.jobs ?? [])
+        .filter((j) => j.auto && TERMINAL.has(j.stage))
+        .map((j) => j.referralId),
+    );
+    const inFlight = [...submitted.current].filter(
+      ([id]) => !processed.current.has(id) && !finished.has(id),
+    );
+    const waiting = queue.filter(
+      (r) => !processed.current.has(r.id) && !submitted.current.has(r.id),
+    );
+    if (!waiting.length) {
+      if (!inFlight.length) stop("DONE");
       return;
     }
+    const concurrency = Math.max(1, ext.run.concurrency || 1);
+    if (inFlight.length >= concurrency) return;
+
+    const next = waiting[0];
+    const date = toLhimsDate(getDateKey(next));
+    if (!date) {
+      if (!inFlight.length) stop("BAD_DATE");
+      return;
+    }
+    // one admission date at a time: the LHIMS list tabs are opened for a single date
+    if (inFlight.some(([, d]) => d !== date)) return;
+
     busy.current = true;
+    submitted.current.set(next.id, date);
+    waiting.slice(1, 1 + PREBUILD_AHEAD).forEach((r) => {
+      jobFor(r).catch(() => {}); // render ahead; a failure is retried when its turn comes
+    });
+    let retrigger = true;
     (async () => {
       try {
-        const date = toLhimsDate(getDateKey(next));
-        if (!date) {
-          await stop("BAD_DATE");
-          return;
-        }
         let job;
         try {
-          job = await buildJob(next);
+          job = await jobFor(next);
         } catch {
+          submitted.current.delete(next.id);
           await stop("FORM_RENDER_FAILED");
           return;
         }
+        prebuilt.current.delete(next.id);
         const res = await request("SUBMIT_JOB", { ...job, date }, 20000);
-        if (res.ok || res.error === "RUN_STOPPING") return;
+        if (res.ok) return;
+        submitted.current.delete(next.id);
+        if (res.error === "RUN_STOPPING") return;
+        if (res.error === "BUSY") {
+          retrigger = false; // the extension is full: the next state change frees a slot
+          return;
+        }
         if (BAD_DATA.has(res.error)) {
           processed.current.add(next.id);
           actionsRef.current.skipReferral(
@@ -176,12 +237,14 @@ export function useLhimsRun({ queue, queueLoaded, markDone, skipReferral }) {
         }
         await stop(res.error);
       } catch {
+        submitted.current.delete(next.id);
         await stop("APP_ERROR");
       } finally {
         busy.current = false;
+        if (retrigger) setTick((t) => t + 1);
       }
     })();
-  }, [present, queueLoaded, ext, queue]);
+  }, [present, queueLoaded, ext, queue, tick, jobFor]);
 
   const stopRun = useCallback(
     () => request("RUN_STOP", { reason: "OFFICER_STOP" }).catch(() => {}),

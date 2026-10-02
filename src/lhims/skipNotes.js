@@ -23,13 +23,15 @@ const TEXT = {
   NEEDS_ATTENTION: "The extension could not complete this referral.",
 };
 
-export function describeProblem(stage, reason) {
+// `detail` is the extension's short diagnostic (e.g. "not in dropdown (0 options)").
+export function describeProblem(stage, reason, detail = null) {
   let base = null;
   if (stage === "UNVERIFIED")
     base = TEXT.UNVERIFIED; // a save may have happened: always warn
   else if (reason?.startsWith("SELECTOR_")) base = TEXT.SELECTOR;
   else base = TEXT[reason] ?? TEXT[stage] ?? "Problem during auto attach.";
-  return reason ? `${base} (${reason})` : base;
+  const code = [reason, detail].filter(Boolean).join(": ");
+  return code ? `${base} (${code})` : base;
 }
 
 function readAll() {

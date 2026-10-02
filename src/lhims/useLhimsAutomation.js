@@ -9,6 +9,10 @@ const PROBLEM_STAGES = new Set([
   "LOGGED_OUT",
   "EXTENSION_ERROR",
 ]);
+// The newest extension job for this referral (the extension lists every job in `jobs`).
+const jobOf = (state, id) =>
+  state?.jobs?.find((j) => j.referralId === id) ??
+  (state?.referralId === id ? state : null);
 const isRunActive = (run) =>
   run?.status === "RUNNING" || run?.status === "STOPPING";
 const flagKey = (kind, id) => `lhims:${kind}:${id}`;
@@ -62,7 +66,8 @@ export function useLhimsAutomation(referral) {
         runActiveRef.current = active;
         setRunActive(active);
         if (m.state.breaker) setBreaker(m.state.breaker);
-        if (m.state.referralId === id) setState(m.state);
+        const mine = jobOf(m.state, id);
+        if (mine) setState(mine);
         else if (m.state.stage === "IDLE") setState({ stage: "IDLE" });
       }
     });
@@ -89,7 +94,7 @@ export function useLhimsAutomation(referral) {
     const res = await request("SUBMIT_JOB", { ...job, retry }, 15000);
     if (!isAlive()) return;
     if (!res.ok) setLocalProblem({ code: res.error });
-    else setState(res.state);
+    else setState(jobOf(res.state, r.id) ?? res.state);
   }, []);
 
   // 2) job lifecycle: adopt, send (manual mode only), cancel on change/unmount
@@ -104,8 +109,9 @@ export function useLhimsAutomation(referral) {
         const active = isRunActive(cur.run);
         runActiveRef.current = active;
         setRunActive(active);
-        if (cur.referralId === id && cur.stage !== "IDLE") {
-          setState(cur);
+        const mine = jobOf(cur, id);
+        if (mine && mine.stage !== "IDLE") {
+          setState(mine);
           return;
         } // adopt after app reload / auto run
         if (active) return; // the auto run controller sends the jobs

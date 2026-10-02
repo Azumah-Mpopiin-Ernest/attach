@@ -39,11 +39,11 @@ globalThis.LA_Badge = (() => {
   const REASONS = {
     NO_MATCH: "No exact match: skip in the app.",
     MULTIPLE_MATCHES: "Several matches: skip in the app.",
-    NO_USABLE_ROW: "All matching rows are green or red: skip in the app.",
+    NO_USABLE_ROW: "All matching rows are green or red (an auto run marks it done).",
     TIMEOUT: "Timed out. Finish manually or skip in the app.",
     TAB_CLOSED: "Tab was closed. Restart from the app.",
     ALREADY_ATTACHED:
-      "This visit already shows the referral note. Check LHIMS before doing anything.",
+      "This visit already shows the referral note (an auto run marks it done).",
     UNEXPECTED_DIALOG:
       "LHIMS showed a message the extension did not expect. Look at the page.",
     NAME_NOT_VERIFIABLE: "The patient name could not be read on the page.",
@@ -71,7 +71,7 @@ globalThis.LA_Badge = (() => {
             id: "stop",
             label:
               run.status === "STOPPING"
-                ? "Stopping after this patient…"
+                ? "Stopping after the current save…"
                 : "Stop auto run",
           },
         ]
