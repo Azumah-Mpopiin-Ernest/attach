@@ -149,6 +149,21 @@
         ? r()
         : addEventListener("load", r, { once: true }),
     );
+  // The page's HTML is parsed and its own start-up code (inline scripts,
+  // jQuery ready handlers) has run, without waiting for every image in
+  // LHIMS's menu like `loaded` does. Enough for the attachment and
+  // confirmation pages, whose content is all in their HTML.
+  // Safety switch: WAIT_FULL_LOAD: true in config.js restores the old full-load wait.
+  const domReady = async () => {
+    if (C.WAIT_FULL_LOAD) return loaded();
+    if (document.readyState === "loading")
+      await new Promise((r) =>
+        document.addEventListener("DOMContentLoaded", r, { once: true }),
+      );
+    // two task turns: ready handlers queued on DOMContentLoaded run first
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+  };
   const b64ToBytes = (b64) => {
     const bin = atob(b64);
     const u = new Uint8Array(bin.length);
@@ -197,13 +212,19 @@
   // the previous date for a moment. Wait for it to settle on `want` before
   // judging; resolves with the date finally shown.
   const DATE_SETTLE_MS = C.DATE_SETTLE_MS ?? 8000;
+  // A loaded list never changes date (only a new load can), so once the
+  // date has settled it is remembered for the rest of this page.
+  let settledShown = null;
   async function settledDate(want) {
     if (!want) return pageDate();
+    if (settledShown === want) return settledShown;
     await waitUntil(() => {
       const shown = pageDate();
       return !shown || shown === want;
     }, DATE_SETTLE_MS);
-    return pageDate();
+    const shown = pageDate();
+    if (shown === want) settledShown = shown;
+    return shown;
   }
 
   // ---------- Filter & Lock: make LHIMS show another date ----------
@@ -435,7 +456,11 @@
   };
 
   // A freshly loaded list may still be filling in: wait for content, then a short quiet spell.
+  // Only the first search on a page waits; a list tab kept from the previous
+  // patient is already complete.
+  let listSettledOnce = false;
   async function listSettled(sel) {
+    if (listSettledOnce) return;
     await waitUntil(
       () =>
         (gridEl() && all(S.list.patientLink, gridEl()).length > 0) ||
@@ -443,6 +468,7 @@
       LIST_LOAD_MS,
     );
     if (gridEl()) await settle(gridEl(), 400);
+    listSettledOnce = true;
   }
 
   // Search like a person: open the dropdown, paste the ID, click the patient that appears.
@@ -518,6 +544,7 @@
 
     // 1) fastest: the patient's visits are already listed
     let found = visitsOf(want);
+    const listedAtOnce = Boolean(found); // the settled list already shows all its rows
 
     // 2) pick the patient in the dropdown (it filters the list in the page)
     let tried = "";
@@ -555,7 +582,8 @@
         `${sel.options.length} options (e.g. ${mask(sample)}); ${tried}`,
       );
     }
-    await settle(gridEl(), 300); // let the rest of this patient's rows render
+    // after the dropdown filtered the list, let the rest of this patient's rows render
+    if (!listedAtOnce) await settle(gridEl(), 300);
     stillHere();
     return pickVisit(job, visitsOf(want) || found);
   }
@@ -698,7 +726,7 @@
     } catch {
       /* ignore */
     }
-    await loaded();
+    await domReady();
     // Identity: the visit opened must be the one chosen from the exact-ID row.
     if (
       new URL(location.href).searchParams.get("iScheduleID") !==
@@ -855,7 +883,7 @@
     if (verifying) return;
     verifying = true;
     try {
-      await loaded();
+      await domReady(); // the attachment links are in the page's HTML
       if (job.fieldsOk === false)
         throw new Problem("UNVERIFIED", "FIELDS_CHANGED");
       if (

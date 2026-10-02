@@ -17,7 +17,7 @@ const appMatches = C.APP_ORIGINS.map((o) => {
 const manifest = {
   manifest_version: 3,
   name: "LHIMS Referral Assist",
-  version: "0.6.0",
+  version: "0.7.0",
   description:
     "Assists and automates attaching referral forms in LHIMS. Local only.",
   minimum_chrome_version: "120",
@@ -40,7 +40,9 @@ const manifest = {
     {
       matches: C.LHIMS_URL_PATTERNS,
       js: ["config.js", "badge.js", "lhims.js"],
-      run_at: "document_idle",
+      // as soon as the page's HTML is parsed: the work pages (attachment,
+      // confirmation) never wait for LHIMS's images (see domReady in lhims.js)
+      run_at: "document_end",
       all_frames: false,
     },
   ],
