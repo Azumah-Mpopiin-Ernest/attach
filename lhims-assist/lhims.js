@@ -205,22 +205,82 @@
     }, DATE_SETTLE_MS);
     return pageDate();
   }
-  let switchTried = false;
-  // Ask LHIMS for another date the way a person does: type it into the
-  // page's date box and press Enter. If the page reloads, it says HELLO again.
-  function trySwitchDate(target) {
-    if (switchTried) return;
-    switchTried = true;
-    const box = dateBox();
-    if (!box) return;
-    dbg("switching list date", box.value, "->", target);
-    box.focus();
-    setNative(box, target);
-    for (const t of ["keydown", "keypress", "keyup"])
-      box.dispatchEvent(
-        new KeyboardEvent(t, { bubbles: true, key: "Enter", keyCode: 13, which: 13 }),
+
+  // ---------- Filter & Lock: make LHIMS show another date ----------
+  // LHIMS shows the date locked with "Filter & Lock" for the whole session and
+  // ignores the date in the list address. Filter & Lock is one POST to
+  // runTimeSession.php (from a Network capture); it is sent here with the new
+  // date. Without a CSRF token on the page, the Filter Selection page itself is
+  // used: set its date and click Filter & Lock, as a person does.
+  const LOCK = {
+    url: "runTimeSession.php",
+    sFlag: "newLockCalendarManagerFilter",
+    dateField: "schedul_date",
+    fields: {
+      clinic: "1,0",
+      iStaff: "",
+      idSuperServiceTypeID: "",
+      dept: "",
+      idShowAllPatientAppointments: "2",
+    },
+    filterDateInput: "#idScheduleDate",
+    filterLockButton: "#idBtnFilterLock",
+    ...(C.LOCK || {}),
+  };
+  function csrfToken() {
+    const meta = document.querySelector('meta[name*="csrf" i]');
+    if (meta?.content) return meta.content;
+    const input = document.querySelector(
+      'input[name*="csrf" i], input[id*="csrf" i]',
+    );
+    if (input?.value) return input.value;
+    for (const s of document.querySelectorAll("script:not([src])")) {
+      const m = s.textContent.match(
+        /csrf[\w$]*['"]?\s*[:=,]\s*['"]([A-Za-z0-9]{20,})['"]/i,
       );
-    fire(box, "blur");
+      if (m) return m[1];
+    }
+    const c = document.cookie.match(/(?:^|;\s*)[\w-]*csrf[\w-]*=([^;]+)/i);
+    return c ? decodeURIComponent(c[1]) : null;
+  }
+  async function lockDate(date) {
+    const token = csrfToken();
+    if (token) {
+      const body = new URLSearchParams({
+        _isAjax: "true",
+        _csrf_token: token,
+        sFlag: LOCK.sFlag,
+        [LOCK.dateField]: date,
+        ...LOCK.fields,
+      });
+      try {
+        const res = await fetch(new URL(LOCK.url, location.href), {
+          method: "POST",
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+          },
+          body,
+        });
+        dbg("lock request", date, res.status);
+        if (res.ok) return { ok: true, via: "request" };
+      } catch (e) {
+        dbg("lock request failed", e);
+      }
+    }
+    // fallback: drive the Filter Selection page like a person
+    const box = document.querySelector(LOCK.filterDateInput);
+    const btn = document.querySelector(LOCK.filterLockButton);
+    if (pageKind() === "FILTER" && box && btn) {
+      box.value = date; // readonly datepicker box: set directly
+      fire(box, "change");
+      btn.click(); // LHIMS sends the lock and opens a list tab (the extension closes it)
+      await sleep(2500);
+      return { ok: true, via: "page" };
+    }
+    return { ok: false, error: token ? "LOCK_REQUEST_FAILED" : "NO_CSRF_TOKEN" };
   }
   const listDate = () =>
     new URL(location.href).searchParams.get("dScheduleDate");
@@ -935,8 +995,14 @@
     if (r.job && !TERMINAL.has(state.stage)) resume(r.job);
   }
 
-  chrome.runtime.onMessage.addListener((m, sender) => {
+  chrome.runtime.onMessage.addListener((m, sender, sendResponse) => {
     if (sender.id !== chrome.runtime.id || m?.channel !== "TO_LHIMS") return;
+    if (m.type === "LOCK_DATE") {
+      lockDate(String(m.date || "")).then(sendResponse, (e) =>
+        sendResponse({ ok: false, error: String(e?.message || e) }),
+      );
+      return true; // answered asynchronously
+    }
     if (m.type === "AUTO_GO") {
       adoptJob().catch(handleError);
       return;
@@ -997,7 +1063,6 @@
       state = r.state;
       aborted = TERMINAL.has(state.stage);
       Badge.render(state, ctx());
-      if (r.switchDate) trySwitchDate(r.switchDate); // this list shows the wrong date
       if (r.job && !TERMINAL.has(state.stage)) resume(r.job);
     } catch (e) {
       handleError(e);

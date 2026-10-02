@@ -88,9 +88,10 @@ export default function LhimsRunBar({ lhims }) {
           {active && pool?.wrongDate && (
             <p role="alert" className="mt-1 font-medium text-amber-800">
               LHIMS is showing {pool.wrongDate}, but these referrals are for{" "}
-              {run.date}. The extension is trying to switch the date. If it
-              does not within a minute: in LHIMS open Filter Selection, choose{" "}
-              {run.date} and press Filter &amp; Lock.
+              {run.date}. The extension is locking the new date (Filter &amp;
+              Lock) and reopening the tabs. If it does not change within a
+              minute: in LHIMS open Filter Selection, choose {run.date} and
+              press Filter &amp; Lock.
             </p>
           )}
           {timingLine(run) && (

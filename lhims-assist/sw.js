@@ -335,6 +335,59 @@ async function recordTiming(prev, next) {
   });
 }
 
+// ---------- Filter & Lock ----------
+// LHIMS shows the session's locked date on every list tab, whatever the
+// address says. Before list tabs are (re)opened for a date, one LHIMS tab is
+// asked to lock that date (lhims.js lockDate). The run's start tab (Filter
+// Selection) is asked first, since it can also click Filter & Lock itself.
+function withTimeout(p, ms) {
+  let timer;
+  return Promise.race([
+    p,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("TIMEOUT")), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function lockDate(date) {
+  const run = await read("run");
+  const ids = [
+    run?.filterTabId,
+    ...(await read("tabs", [])),
+    ...Object.keys(await read("pool", {})).map(Number),
+  ].filter((id, i, a) => id != null && a.indexOf(id) === i);
+  if (run) await store.set({ run: { ...run, lockTriedAt: Date.now() } });
+  for (const id of ids) {
+    try {
+      await store.set({ locking: { tabId: id, until: Date.now() + 15000 } });
+      const r = await withTimeout(
+        chrome.tabs.sendMessage(id, { channel: "TO_LHIMS", type: "LOCK_DATE", date }),
+        10000,
+      );
+      if (r?.ok) {
+        const cur = await read("run");
+        if (cur) await store.set({ run: { ...cur, lockedDate: date } });
+        return true;
+      }
+    } catch {
+      /* tab gone, loading or not an LHIMS page: try the next one */
+    } finally {
+      await store.remove("locking");
+    }
+  }
+  return false;
+}
+
+// Filter & Lock clicked on the page opens a list tab of its own: close it.
+chrome.tabs.onCreated.addListener((tab) =>
+  locked(async () => {
+    const l = await read("locking");
+    if (l && tab.openerTabId === l.tabId && Date.now() < l.until)
+      chrome.tabs.remove(tab.id).catch(() => {});
+  }),
+);
+
 // ---------- auto-run: tab pool ----------
 async function poolFill() {
   const run = await read("run");
@@ -609,7 +662,10 @@ async function submit(p, breaker) {
   if (auto) {
     const dateChanged = run.date !== p.date;
     await store.set({ run: { ...run, date: p.date } });
-    if (dateChanged) await poolFill();
+    if (dateChanged) {
+      await lockDate(p.date); // LHIMS must show the new date before the tabs reopen
+      await poolFill();
+    }
   }
   await broadcast();
   if (auto) await assign();
@@ -630,6 +686,7 @@ async function startRun(p, sender, breaker, run) {
       status: "RUNNING",
       base: ps.base,
       windowId: ps.windowId,
+      filterTabId: ps.tabId ?? null,
       date: p.date,
       done: 0,
       skipped: 0,
@@ -647,6 +704,7 @@ async function startRun(p, sender, breaker, run) {
     periodInMinutes: 1,
   });
   chrome.tabs.update(sender.tab.id, { autoDiscardable: false }).catch(() => {});
+  await lockDate(p.date); // the first date too: no manual Filter & Lock needed
   await poolFill();
   await broadcast();
   return { ok: true };
@@ -707,7 +765,6 @@ async function onLhims(msg, sender) {
       await store.set({ tabs: [...tabs] });
       const pool = await read("pool", {});
       const p = pool[tabId];
-      let switchDate = null;
       if (
         p &&
         !p.busy &&
@@ -721,15 +778,21 @@ async function onLhims(msg, sender) {
         const wrong = msg.shown && msg.shown !== p.date ? msg.shown : null;
         pool[tabId] = { ...p, ready: !wrong, wrongDate: wrong };
         await store.set({ pool });
-        if (wrong) switchDate = p.date;
-        else await assign();
+        if (wrong) {
+          // LHIMS still shows another date: lock the run's date again (at most
+          // every 20 s) and reload the tabs that showed the wrong one
+          const cur = await read("run");
+          if (Date.now() - (cur?.lockTriedAt || 0) > 20000) {
+            await lockDate(p.date);
+            await poolFill();
+          }
+        } else await assign();
         if (!wrong && Object.values(pool).some((x) => x.wrongDate))
           await poolFill(); // the date is right now: reload tabs that showed the old one
       }
       return {
         ok: true,
         tabId,
-        ...(switchDate ? { switchDate } : {}),
         ...(await view(jobForTab(await readJobs(), tabId))),
       };
     }
@@ -795,6 +858,7 @@ async function onLhims(msg, sender) {
       await store.set({
         pendingStart: {
           base: sender.url,
+          tabId: sender.tab.id,
           windowId: sender.tab.windowId,
           at: Date.now(),
         },
@@ -870,6 +934,12 @@ chrome.alarms.onAlarm.addListener((a) => {
         const wrong = Object.values(pool).some((x) => x.wrongDate);
         return stopRun(wrong ? "WRONG_DATE" : "NO_READY_TAB", true);
       }
+      const pool = await read("pool", {});
+      if (
+        Object.values(pool).some((x) => x.wrongDate) &&
+        Date.now() - (run.lockTriedAt || 0) > 20000
+      )
+        await lockDate(run.date); // try the lock again before reloading
       await poolFill();
       await assign();
     });
